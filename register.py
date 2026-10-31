@@ -117,6 +117,7 @@ CLAUDE_NODE_USAGE_LEGACY_FILE = os.path.join(
 CLAUDE_WEB_LOGIN_HCAPTCHA_SITEKEY = "a8086506-2036-46f4-ae50-00d8be805efa"
 CLAUDE_HCAPTCHA_DRAG_MARKERS = (
     "drag", "drop", "move the", "drag-and-drop",
+    "put the correct piece in the missing spot", "missing spot",
     "\ub04c\uc5b4\ub2e4", "\ub4dc\ub798\uadf8",
     "\u30c9\u30e9\u30c3\u30b0", "\u62d6\u52a8", "\u62d6\u66f3", "\u62d6\u653e",
     "ziehen sie", "verschieben", "faites glisser", "arrastra", "arraste",
