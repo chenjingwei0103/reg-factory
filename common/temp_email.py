@@ -31,10 +31,14 @@ import string
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
 
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 import requests
 
@@ -46,7 +50,7 @@ try:
         YYDS_BASE_URL, YYDS_API_KEY,
         GPTMAIL_BASE_URL, GPTMAIL_API_KEY,
         REMAIL_BASE_URL, REMAIL_API_KEY, REMAIL_PROJECT_ID, REMAIL_EMAIL_SUFFIX, REMAIL_SUPPLY,
-        CFMAIL_BASE_URL, CFMAIL_ADMIN_PASSWORD, CFMAIL_SITE_PASSWORD,
+        CFMAIL_BASE_URL, CFMAIL_ADMIN_PASSWORD, CFMAIL_SITE_PASSWORD, CFMAIL_DOMAIN,
         CUSTOM_MAIL_BASE_URL, CUSTOM_MAIL_AUTH_HEADER, CUSTOM_MAIL_API_KEY,
         CUSTOM_MAIL_AUTH_PREFIX, CUSTOM_MAIL_CREATE_METHOD, CUSTOM_MAIL_CREATE_PATH,
         CUSTOM_MAIL_CREATE_BODY, CUSTOM_MAIL_EMAIL_PATH, CUSTOM_MAIL_ID_PATH,
@@ -172,8 +176,12 @@ def _extract_codes_and_links(text):
     """从一段文本里抽验证码 + 链接，返回 {"codes": [...], "links": [...]}。
     先剥 HTML 再匹配，数字码 + 带分隔符码都收。"""
     clean = _strip_html(text or "")
+    # Links carry ids like ?LinkId=521839; those digits are not verification
+    # codes. Strip URLs before scanning so a resend cannot "find" them instead
+    # of the real code.
+    clean = re.sub(r"https?://\S+", " ", clean)
     codes = []
-    for m in _DASH_CODE_RE.findall(text or ""):
+    for m in _DASH_CODE_RE.findall(clean):
         if m not in codes:
             codes.append(m)
     for m in _CODE_RE.findall(clean):
@@ -757,6 +765,78 @@ def _remail_fetch(mailbox_id, email, token, api_key, base_url, sess):
 
 
 # ==================================================================== Cloudflare Temp Email
+def _dns_has_mx(domain, server):
+    """Return whether a DNS server has an MX answer for the domain."""
+    import socket
+    import struct
+
+    name = str(domain or "").strip().lower().rstrip(".")
+    if not name:
+        return False
+    labels = name.split(".")
+    question = b"".join(bytes([len(label)]) + label.encode("ascii") for label in labels)
+    question += b"\x00" + struct.pack("!HH", 15, 1)
+    transaction = random.randint(0, 65535)
+    packet = struct.pack("!HHHHHH", transaction, 0x0100, 1, 0, 0, 0) + question
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2)
+    try:
+        sock.sendto(packet, (server, 53))
+        data, _ = sock.recvfrom(2048)
+    finally:
+        sock.close()
+    if len(data) < 12 or struct.unpack("!H", data[:2])[0] != transaction:
+        raise OSError("invalid MX response")
+    rcode = data[3] & 0x0F
+    answers = struct.unpack("!H", data[6:8])[0]
+    return rcode == 0 and answers > 0
+
+
+_MX_CACHE = {}
+
+
+def _domain_has_mx(domain):
+    """Resolve MX directly so a local fake-ip resolver cannot hide it."""
+    key = str(domain or "").strip().lower().rstrip(".")
+    if not key:
+        return False
+    cached = _MX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    last_error = None
+    for server in ("1.1.1.1", "8.8.8.8"):
+        try:
+            found = _dns_has_mx(key, server)
+        except Exception as exc:
+            last_error = exc
+            continue
+        _MX_CACHE[key] = found
+        return found
+    raise OSError("MX lookup failed for %s: %s" % (key, last_error))
+
+
+def _cfmail_receivable_domains(pool, has_mx=None):
+    """Keep domains that can receive mail.
+
+    A complete DNS failure leaves the original pool alone. A successful
+    lookup with no MX removes that domain.
+    """
+    checker = has_mx or _domain_has_mx
+    receivable = []
+    answered = False
+    for domain in pool:
+        try:
+            ok = checker(domain)
+        except Exception:
+            continue
+        answered = True
+        if ok:
+            receivable.append(domain)
+    if receivable or answered:
+        return receivable
+    return list(pool)
+
+
 def _cfmail_pick_domain(base, sess, site_pw):
     try:
         headers = {"x-custom-auth": site_pw} if site_pw else {}
@@ -772,7 +852,10 @@ def _cfmail_pick_domain(base, sess, site_pw):
                 for v in vals:
                     pool.append(v.get("value") if isinstance(v, dict) else v)
         pool = [p for p in pool if p]
-        return random.choice(pool) if pool else None
+        receivable = _cfmail_receivable_domains(pool)
+        if not receivable:
+            return None
+        return random.choice(receivable)
     except Exception:
         return None
 
@@ -1046,8 +1129,53 @@ def _hit(msg, sender_hint, subject_hint):
     return False
 
 
+def _message_sort_key(message):
+    """Sort key from a provider timestamp; unknown timestamps sink to the end."""
+    for key in ("received_at", "received", "created_at", "date", "timestamp"):
+        value = message.get(key)
+        if not value:
+            continue
+        try:
+            if isinstance(value, (int, float)):
+                return float(value)
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+            # CFMail timestamps are timezone-naive local (Asia/Shanghai) time;
+            # treating them as UTC shifts the order by 8 hours.
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+            return parsed.timestamp()
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _message_too_old(message, received_after):
+    """Return whether a temporary-mail message predates a verification request."""
+    if not received_after:
+        return False
+    value = next((message.get(key) for key in (
+        "received_at", "received", "created_at", "date", "timestamp",
+    ) if message.get(key)), None)
+    if value is None:
+        return False
+    try:
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+        else:
+            parsed = datetime.fromisoformat(
+                str(value).strip().replace("Z", "+00:00")
+            )
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            timestamp = parsed.timestamp()
+        return timestamp < float(received_after) - 5
+    except (TypeError, ValueError):
+        return False
+
+
 def _scan_once(mailbox_id, provider, email, token, api_key, base_url,
-               sender_hint, subject_hint, code_regex, exclude_codes=()):
+               sender_hint, subject_hint, code_regex, exclude_codes=(),
+               received_after=None):
     """同步扫一轮，命中目标邮件就返回 code，否则 None。给 poll 用 executor 调。"""
     try:
         msgs = fetch_messages(mailbox_id, provider, email=email, token=token,
@@ -1057,8 +1185,13 @@ def _scan_once(mailbox_id, provider, email, token, api_key, base_url,
         return None
     pat = re.compile(code_regex) if code_regex else None
     excluded = {str(code) for code in (exclude_codes or ()) if code}
+    # newest first: providers return oldest-first, so the previous attempt's
+    # (now rejected) code is otherwise the first candidate on every resend
+    msgs = sorted(msgs, key=_message_sort_key, reverse=True)
     for m in msgs:
         if not _hit(m, sender_hint, subject_hint):
+            continue
+        if _message_too_old(m, received_after):
             continue
         if pat:
             # A caller-supplied pattern is a hard constraint. Do not fall back
@@ -1096,7 +1229,7 @@ async def poll_verification_code(mailbox_id, provider, email=None, token=None,
                                  api_key=None, base_url=None,
                                  max_wait=120, poll_interval=5,
                                  sender_hint=(), subject_hint=(), code_regex=None,
-                                 exclude_codes=()):
+                                 exclude_codes=(), received_after=None):
     """轮询临时邮箱直到拿到验证码或超时。返回 code 字符串或 None。
     - sender_hint/subject_hint：筛选目标邮件（宽松匹配）。
     - code_regex：给定则用它提码（如 grok 的 XXX-XXX），否则用默认 6-8 位数字。
@@ -1107,7 +1240,8 @@ async def poll_verification_code(mailbox_id, provider, email=None, token=None,
     while time.time() - start < max_wait:
         code = await loop.run_in_executor(
             None, _scan_once, mailbox_id, provider, email, token, api_key, base_url,
-            tuple(sender_hint), tuple(subject_hint), code_regex, tuple(exclude_codes))
+            tuple(sender_hint), tuple(subject_hint), code_regex, tuple(exclude_codes),
+            received_after)
         if code:
             print("  [temp-email] code found: ******")
             return code
@@ -1122,14 +1256,14 @@ def poll_verification_code_blocking(mailbox_id, provider, email=None, token=None
                                     api_key=None, base_url=None,
                                     max_wait=120, poll_interval=5,
                                     sender_hint=(), subject_hint=(), code_regex=None,
-                                    exclude_codes=()):
+                                    exclude_codes=(), received_after=None):
     """Synchronous companion for HTTP-only flows such as Outlook Graph OAuth."""
     start = time.time()
     while time.time() - start < max_wait:
         code = _scan_once(
             mailbox_id, provider, email, token, api_key, base_url,
             tuple(sender_hint), tuple(subject_hint), code_regex,
-            tuple(exclude_codes),
+            tuple(exclude_codes), received_after,
         )
         if code:
             print("  [temp-email] code found: ******")

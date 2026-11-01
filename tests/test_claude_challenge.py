@@ -17,6 +17,9 @@ class ClaudeChallengeTests(unittest.IsolatedAsyncioTestCase):
             register.HCAPTCHA_HOOK_JS,
         )
 
+    def test_hcaptcha_hook_does_not_poll_the_live_widget(self):
+        self.assertNotIn("setInterval", register.HCAPTCHA_HOOK_JS)
+
     async def test_authenticated_bootstrap_restores_traffic_saver(self):
         page = MagicMock()
         page.context = MagicMock()
@@ -181,7 +184,13 @@ class ClaudeChallengeTests(unittest.IsolatedAsyncioTestCase):
         ))
 
     def setUp(self):
-        self.proxy_env = patch.dict(os.environ, {"PROXY_MODE": "clash_auto"})
+        self.proxy_env = patch.dict(
+            os.environ,
+            {
+                "PROXY_MODE": "clash_auto",
+                "REG_FACTORY_CLAUDE_PAUSE_AT_HCAPTCHA": "0",
+            },
+        )
         self.proxy_env.start()
         self.addCleanup(self.proxy_env.stop)
 
@@ -408,6 +417,30 @@ class ClaudeChallengeTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(answer, "PICK=[2]")
+        self.assertEqual(regular_post.call_count, 3)
+        curl_post.assert_called_once()
+
+    def test_primary_vision_request_uses_chrome_tls_after_requests_fail(self):
+        from vision_solver import vision
+
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "choices": [{"message": {"content": "SHAPE=square COLOR=red"}}]
+        }
+        with (
+            patch.object(
+                vision.requests,
+                "post",
+                side_effect=vision.requests.exceptions.SSLError("unexpected eof"),
+            ) as regular_post,
+            patch("curl_cffi.requests.post", return_value=response) as curl_post,
+            patch.object(vision.time, "sleep"),
+        ):
+            answer = vision.ask_vision(
+                "synthetic geometry", "aW1hZ2U=", models=["auto"], keys=["key"], max_tokens=40
+            )
+
+        self.assertEqual(answer, "SHAPE=square COLOR=red")
         self.assertEqual(regular_post.call_count, 3)
         curl_post.assert_called_once()
 
@@ -877,6 +910,29 @@ class ClaudeChallengeTests(unittest.IsolatedAsyncioTestCase):
         page.goto.assert_awaited_once_with(
             "https://claude.ai/", timeout=60000, wait_until="domcontentloaded"
         )
+
+    def test_native_verify_accepts_new_account_without_memberships(self):
+        page = MagicMock()
+        page._rf_magic_verify_status = 200
+        page._rf_magic_verify_response_body = (
+            '{"success":true,"secret":null,"account":'
+            '{"memberships":[],"is_verified":false}}'
+        )
+
+        self.assertTrue(register._native_claude_magic_verify_succeeded(page))
+
+    async def test_manual_pause_continues_when_native_verify_succeeds(self):
+        page = MagicMock()
+        page.is_closed.side_effect = RuntimeError("navigation")
+        page._rf_magic_verify_status = 200
+        page._rf_magic_verify_response_body = (
+            '{"success":true,"account":{"memberships":[]}}'
+        )
+
+        with patch.object(register.asyncio, "sleep", AsyncMock()) as sleep:
+            await register._pause_claude_page_for_manual_test(page, "pause")
+
+        sleep.assert_not_awaited()
 
     async def test_native_200_after_slow_captcha_beats_deadline(self):
         page = MagicMock()
@@ -1522,6 +1578,47 @@ class ClaudeChallengeTests(unittest.IsolatedAsyncioTestCase):
             timeout=30000,
             wait_until="commit",
         )
+
+    def test_email_link_code_prefers_standalone_digits(self):
+        self.assertEqual(
+            register._pick_verification_code(["2026", "482913"], "year 2026"),
+            "482913",
+        )
+        self.assertEqual(
+            register._pick_verification_code([], "Your login code is 135790"),
+            "135790",
+        )
+
+    async def test_email_code_is_read_in_new_tab_and_typed_into_claude(self):
+        page = MagicMock()
+        page.url = "https://claude.ai/login"
+        page.goto = AsyncMock()
+        context = MagicMock()
+        code_tab = MagicMock()
+        code_tab.goto = AsyncMock()
+        code_tab.close = AsyncMock()
+        code_tab.evaluate = AsyncMock(return_value={
+            "singles": ["482913"],
+            "preview": "Your login code is 482913",
+        })
+        context.new_page = AsyncMock(return_value=code_tab)
+        with (
+            patch.object(register, "submit_claude_email_code", AsyncMock()) as submit,
+            patch.object(
+                register, "continue_claude_after_email_code", AsyncMock()
+            ) as continue_page,
+            patch.object(register.asyncio, "sleep", AsyncMock()),
+        ):
+            await register.complete_claude_email_code_on_login_page(
+                context, page, "https://claude.ai/magic-link#nonce:email"
+            )
+
+        page.goto.assert_not_called()
+        code_tab.goto.assert_awaited_once()
+        self.assertNotEqual(code_tab.goto.await_args.args[0], page.url)
+        submit.assert_awaited_once_with(page, "482913")
+        continue_page.assert_awaited_once_with(page)
+        code_tab.close.assert_awaited_once()
 
     async def test_email_submission_prefers_visible_form_state(self):
         page = MagicMock()

@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import random
@@ -131,6 +132,14 @@ MICROSOFT_AUTH_TERMINAL_ERRORS = (
             "you have tried to sign in too many times with an incorrect account or password",
         ),
     ),
+    (
+        "account_locked",
+        (
+            "your account has been locked",
+            "your microsoft account has been locked",
+            "has been locked we detected activity",
+        ),
+    ),
 )
 
 # These messages stop the current browser sign-in page, but they do not prove
@@ -140,6 +149,10 @@ MICROSOFT_AUTH_HTTP_FALLBACK_ERRORS = frozenset({
     "password_signin_unavailable",
     "signin_rate_limited",
 })
+
+# Accounts Microsoft locked cannot finish the PerimeterX hold; retrying only
+# burns browser sessions and can lengthen the lockout.
+MICROSOFT_AUTH_HARD_STOP_ERRORS = frozenset({"account_locked"})
 
 
 def microsoft_auth_terminal_error(text):
@@ -861,6 +874,7 @@ MS_POSITIVE_ACTION_LABELS = (
     # Bahasa Indonesia (Indonesia)
     "terima", "izinkan", "lanjutkan", "ya", "setuju", "berikutnya", "oke",
     "setujui dan lanjutkan", "saya setuju",
+    "naprej", "nadaljuj", "sprejmi", "strinjam se", "se strinjam", "v redu", "da",
 )
 MS_NEGATIVE_ACTION_LABELS = (
     "deny", "decline", "cancel", "no", "back",
@@ -905,6 +919,7 @@ MS_SKIP_ACTION_LABELS = (
     # Bahasa Indonesia (Indonesia)
     "lewati untuk saat ini", "lewati", "jangan sekarang", "tidak, terima kasih",
     "mungkin nanti", "nanti",
+    "zavrni", "prekliči", "nazaj", "ne",
 )
 
 
@@ -924,10 +939,10 @@ def _microsoft_url_with_locale(url):
 
 async def _click_microsoft_action(
     page, labels=MS_POSITIVE_ACTION_LABELS, negative_labels=MS_NEGATIVE_ACTION_LABELS,
-    preferred_ids=(),
+    preferred_ids=(), include_links=False,
 ):
     """Click a visible Microsoft action using IDs first and localized text second."""
-    script = r"""({labels, negativeLabels, preferredIds}) => {
+    script = r"""({labels, negativeLabels, preferredIds, includeLinks}) => {
             const normalize = value => String(value || '')
                 .replace(/\s+/g, ' ').trim().toLocaleLowerCase();
             const visible = el => {
@@ -952,8 +967,9 @@ async def _click_microsoft_action(
                 }
             }
             const controls = document.querySelectorAll(
-                'button, a[role="button"], input[type="submit"], '
-                + 'input[type="button"], [role="button"]'
+                includeLinks
+                    ? 'button, a, input[type="submit"], input[type="button"], [role="button"]'
+                    : 'button, a[role="button"], input[type="submit"], input[type="button"], [role="button"]'
             );
             for (const el of controls) {
                 if (!visible(el)) continue;
@@ -964,6 +980,7 @@ async def _click_microsoft_action(
                     return text;
                 }
             }
+            if (includeLinks) return '';
             const positiveIdentifiers = new Set([
                 'accept', 'allow', 'approve', 'consent', 'continue',
                 'next', 'yes', 'confirm', 'primary'
@@ -990,6 +1007,7 @@ async def _click_microsoft_action(
         "labels": [label.lower() for label in labels],
         "negativeLabels": [label.lower() for label in negative_labels],
         "preferredIds": list(preferred_ids),
+        "includeLinks": bool(include_links),
     }
     # KMSI and consent controls may be rendered inside an auth iframe. The
     # page body still exposes the prompt text, so checking only the top-level
@@ -1254,23 +1272,28 @@ def _microsoft_direct_session():
 
 
 def _request_graph_device_code():
-    session = _microsoft_direct_session()
-    try:
-        response = session.post(
-            GRAPH_DEVICE_CODE_URL,
-            data={"client_id": GRAPH_CLIENT_ID, "scope": GRAPH_SCOPE},
-            timeout=30,
-        )
-        data = response.json()
-    except Exception as e:
-        print(f"  [graph] device-code request error: {str(e)[:120]}")
-        return None
-    finally:
-        session.close()
-    if response.status_code == 200 and data.get("device_code") and data.get("user_code"):
-        return data
-    error = data.get("error_description") or data.get("error") or "unknown error"
-    print(f"  [graph] device-code request failed: {str(error)[:140]}")
+    for attempt in range(1, 4):
+        session = _microsoft_direct_session()
+        try:
+            response = session.post(
+                GRAPH_DEVICE_CODE_URL,
+                data={"client_id": GRAPH_CLIENT_ID, "scope": GRAPH_SCOPE},
+                timeout=30,
+            )
+            data = response.json()
+            if response.status_code == 200 and data.get("device_code") and data.get("user_code"):
+                return data
+            error = data.get("error_description") or data.get("error") or "unknown error"
+            print(f"  [graph] device-code request failed: {str(error)[:140]}")
+            return None
+        except Exception as e:
+            if attempt < 3:
+                time.sleep(1.5)
+                continue
+            print(f"  [graph] device-code request error: {str(e)[:120]}")
+            return None
+        finally:
+            session.close()
     return None
 
 
@@ -1317,6 +1340,8 @@ async def _skip_optional_recovery_email(page, idx=0):
     page_markers = (
         "recovery email", "alternate email", "add an email address",
         "security info", "help us protect your account",
+        "help protect your account", "add an email", "add email",
+        "アカウントの保護にご協力ください", "メール アドレスを追加", "メールの追加",
         "adresse e-mail de récupération", "informations de sécurité",
         "correo de recuperación", "información de seguridad",
         "wiederherstellungs-e-mail", "sicherheitsinformationen",
@@ -1390,7 +1415,193 @@ def _graph_recovery_outlook_mailbox():
     ).strip()
 
 
-async def _bind_required_recovery_email(page, state, idx=0):
+async def _first_visible(locator):
+    """Return the first visible match, skipping hidden inputs ahead of it."""
+    try:
+        count = int(await locator.count())
+    except Exception:
+        return None
+    for index in range(min(count, 12)):
+        item = locator.nth(index)
+        try:
+            if await item.is_visible():
+                return item
+        except Exception:
+            continue
+    return None
+
+
+async def _recovery_email_form_diagnostics(page):
+    """Return safe control metadata for a recovery-email form that will not advance."""
+    try:
+        captured = await page.evaluate(r"""() => {
+            const visible = el => {
+                const style = getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden'
+                    && rect.width > 0 && rect.height > 0;
+            };
+            const identity = value => String(value || '').slice(0, 80);
+            return {
+                path: String(location.pathname || '').slice(0, 160),
+                inputs: [...document.querySelectorAll('input')]
+                    .filter(visible).slice(0, 6).map(el => ({
+                        type: identity(el.type),
+                        id: identity(el.id),
+                        name: identity(el.name),
+                        disabled: !!el.disabled,
+                        ariaInvalid: el.getAttribute('aria-invalid') === 'true',
+                        valid: typeof el.checkValidity === 'function' ? el.checkValidity() : null,
+                        valueLength: String(el.value || '').length,
+                        message: identity(el.validationMessage),
+                    })),
+                buttons: [...document.querySelectorAll(
+                    'button, input[type="submit"], input[type="button"]'
+                )].filter(visible).slice(0, 8).map(el => ({
+                    id: identity(el.id),
+                    type: identity(el.type),
+                    disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+                })),
+            };
+        }""", timeout=2000)
+    except Exception:
+        return {"capture": "unavailable"}
+    if not isinstance(captured, dict):
+        return {"capture": "unavailable"}
+
+    def _text(value, limit=160):
+        return str(value or "")[:limit]
+
+    inputs = []
+    for item in list(captured.get("inputs") or [])[:6]:
+        if not isinstance(item, dict):
+            continue
+        inputs.append({
+            "type": _text(item.get("type"), 40),
+            "id": _text(item.get("id"), 80),
+            "name": _text(item.get("name"), 80),
+            "disabled": bool(item.get("disabled")),
+            "ariaInvalid": bool(item.get("ariaInvalid")),
+            "valid": item.get("valid") if item.get("valid") in {True, False, None} else None,
+            "valueLength": max(0, int(item.get("valueLength") or 0)),
+            "message": _text(item.get("message"), 80),
+        })
+    buttons = []
+    for item in list(captured.get("buttons") or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        buttons.append({
+            "id": _text(item.get("id"), 80),
+            "type": _text(item.get("type"), 40),
+            "disabled": bool(item.get("disabled")),
+        })
+    return {"path": _text(captured.get("path")), "inputs": inputs, "buttons": buttons}
+
+
+async def _click_primary_submit(page):
+    """Click the visible primary submit control. Its label is localized."""
+    button = await _first_visible(page.locator(
+        'button[type="submit"], input[type="submit"]'
+    ))
+    if button is None:
+        return False
+    try:
+        await button.click()
+        return True
+    except Exception:
+        return False
+
+
+async def _recovery_code_boxes(page):
+    """Return Microsoft's split code boxes in DOM order."""
+    locator = page.locator('input[id^="codeEntry-"]')
+    try:
+        count = int(await locator.count())
+    except Exception:
+        return []
+    boxes = []
+    for index in range(min(count, 8)):
+        item = locator.nth(index)
+        try:
+            if await item.is_visible():
+                boxes.append(item)
+        except Exception:
+            continue
+    return boxes
+
+
+async def _return_to_recovery_email_form(page, state, tag):
+    """Leave a code page whose address cannot receive the message."""
+    if state.get("code_back_tried"):
+        return False
+    back = await _first_visible(page.locator(
+        '#back-button, button[aria-label="Back" i]'
+    ))
+    if back is None:
+        return False
+    await back.click()
+    state["code_back_tried"] = True
+    state["email_submitted"] = False
+    state["code_submitted"] = False
+    state.pop("mailbox", None)
+    state.pop("code_task", None)
+    state.pop("code_requested_at", None)
+    print(f"  {tag} [graph] left undeliverable code page")
+    await asyncio.sleep(2)
+    return True
+
+
+_RECOVERY_CODE_REJECTION_MARKERS = (
+    "that code didn't work", "check the code and try again",
+    "the code you entered is incorrect", "that code is incorrect",
+    "invalid code",
+)
+
+
+def _recovery_code_was_rejected(body):
+    normalized = " ".join(str(body or "").lower().split())
+    return any(marker in normalized for marker in _RECOVERY_CODE_REJECTION_MARKERS)
+
+
+async def _resend_rejected_recovery_code(page, state, tag):
+    """Request one replacement recovery code and exclude the rejected value."""
+    retries = int(state.get("code_retry_count") or 0)
+    if retries >= 1:
+        state["recovery_code_rejected"] = True
+        print(f"  {tag} [graph] recovery code was rejected after resend")
+        return False
+    old_task = state.pop("code_task", None)
+    if old_task and old_task.done():
+        with contextlib.suppress(Exception):
+            old_code = str(old_task.result())
+            state.setdefault("rejected_codes", []).append(old_code)
+    clicked = await _click_microsoft_action(
+        page,
+        labels=("resend code", "resend", "send a new code", "resend verification code"),
+        negative_labels=(),
+        preferred_ids=("idSubmit_SAOTCResend", "idBtn_SAOTCResend", "resendCodeButton", "ResendCode"),
+        include_links=True,
+    )
+    if not clicked:
+        resend_link = await _first_visible(page.locator(
+            'a:has-text("Resend code"), button:has-text("Resend code"), a:has-text("Resend"), #ResendCode, [aria-label*="resend" i]'
+        ))
+        if resend_link:
+            with contextlib.suppress(Exception):
+                await resend_link.click()
+                clicked = "resend-text-link"
+    if not clicked:
+        return False
+    state["code_submitted"] = False
+    state["code_retry_count"] = retries + 1
+    state["code_requested_at"] = time.time()
+    state.pop("code_timeout_logged", None)
+    print(f"  {tag} [graph] recovery code rejected; resent once")
+    await asyncio.sleep(2)
+    return True
+
+
+async def _bind_required_recovery_email(page, state, idx=0, account_email=""):
     """Fill Microsoft's security-info email form and submit its mailbox code."""
     tag = f"[#{idx}]"
     enabled, provider, timeout, interval = _graph_recovery_settings()
@@ -1401,78 +1612,347 @@ async def _bind_required_recovery_email(page, state, idx=0):
         body = " ".join((await page.locator("body").inner_text(timeout=3000)).split()).lower()
     except Exception:
         return False, False
+    if "reached your limit with this sign-in method" in body:
+        return False, False
     markers = (
         "/proofs/add", "recovery email", "alternate email", "add an email address",
         "security info", "help us protect your account", "security information",
+        "help protect your account", "add an email", "add email",
+        "enter your code", "we sent a code", "code we sent",
+        "アカウントの保護にご協力ください", "メール アドレスを追加", "メールの追加",
         "杈呭姪閭", "鎭㈠閭", "澶囩敤閭", "娣诲姞鐢靛瓙閭欢",
         "पुनर्प्राप्ति ईमेल", "वैकल्पिक ईमेल", "सुरक्षा जानकारी",
         "खाता सुरक्षित रखने में हमारी मदद करें",
         "email pemulihan", "email alternatif", "info keamanan",
         "bantu kami melindungi akun anda", "tambahkan alamat email",
     )
-    if not (
-        state.get("email_submitted") or state.get("code_task")
+    if state.get("code_submitted") and _recovery_code_was_rejected(body):
+        return True, await _resend_rejected_recovery_code(page, state, tag)
+    radio_proof_page = (
+        (
+            "call us overprotective" in body
+            or "where should we send your code" in body
+            or "help us protect your account" in body
+            or "something unusual about this sign-in" in body
+            or "protect your account" in body
+        )
+        and await page.locator('input[type="radio"]').count() > 0
+    )
+    if radio_proof_page and not state.get("email_submitted"):
+        if not state.get("mailbox") and account_email:
+            from common.mailbox import restore_graph_recovery_mailbox
+            state["mailbox"] = await asyncio.to_thread(
+                restore_graph_recovery_mailbox, account_email
+            )
+        radios = page.locator('input[type="radio"]')
+        rcount = await radios.count()
+        target_radio = None
+        mb_email = ((state.get("mailbox") or {}).get("email") or "").lower()
+        for r_idx in range(rcount):
+            r_elem = radios.nth(r_idx)
+            try:
+                if await r_elem.is_visible():
+                    if mb_email:
+                        p_text = " ".join((await r_elem.locator("xpath=..").inner_text(timeout=1000)).split()).lower()
+                        if mb_email in p_text or mb_email.split("@")[0] in p_text:
+                            target_radio = r_elem
+                            break
+                    if target_radio is None:
+                        target_radio = r_elem
+            except Exception:
+                continue
+        if target_radio is not None:
+            try:
+                await target_radio.evaluate(
+                    "el => { el.checked = true; el.dispatchEvent(new Event('change', {bubbles: true})); el.dispatchEvent(new Event('input', {bubbles: true})); el.click(); }"
+                )
+            except Exception:
+                pass
+            with contextlib.suppress(Exception):
+                p_label = target_radio.locator("xpath=ancestor::label[1]")
+                if await p_label.count() > 0:
+                    await p_label.first.click(timeout=1000)
+                else:
+                    await target_radio.locator("xpath=..").click(timeout=1000)
+            await asyncio.sleep(0.5)
+            clicked = await _click_primary_submit(page)
+            if not clicked:
+                clicked = await _click_microsoft_action(
+                    page,
+                    labels=("next", "send code", "continue", "下一步", "发送代码"),
+                    preferred_ids=("iNext", "idSubmit_SAOTCSend", "idBtn_SAOTCSend", "continueButton"),
+                    include_links=True,
+                )
+            if clicked:
+                state["email_submitted"] = True
+                state["code_requested_at"] = time.time()
+                print(f"  {tag} [graph] selected existing recovery email radio; advancing")
+                await asyncio.sleep(2)
+                return True, True
+    proof_input = await _first_visible(page.locator("#proof-confirmation-email-input"))
+    if proof_input is not None:
+        if not state.get("mailbox") and account_email:
+            from common.mailbox import (
+                restore_graph_recovery_mailbox,
+                restore_graph_recovery_mailbox_from_mask,
+            )
+
+            state["mailbox"] = await asyncio.to_thread(
+                restore_graph_recovery_mailbox, account_email
+            )
+            if not state["mailbox"]:
+                masked = re.search(
+                    r"[a-z0-9._+-]+\*+@[a-z0-9-]+(?:\.[a-z0-9-]+)+",
+                    body,
+                )
+                if masked:
+                    state["mailbox"] = await asyncio.to_thread(
+                        restore_graph_recovery_mailbox_from_mask, masked.group(0)
+                    )
+                    if state["mailbox"]:
+                        from common.mailbox import remember_graph_recovery_mailbox
+
+                        await asyncio.to_thread(
+                            remember_graph_recovery_mailbox,
+                            account_email,
+                            state["mailbox"],
+                        )
+        mailbox = state.get("mailbox")
+        if mailbox and not state.get("email_submitted"):
+            try:
+                await proof_input.fill(mailbox["email"])
+                clicked = await _click_microsoft_action(
+                    page,
+                    labels=(
+                        "send code", "send a code", "email me a code",
+                        "send verification code", "发送代码", "发送验证码",
+                    ),
+                    negative_labels=(),
+                    preferred_ids=(
+                        "idSubmit_SAOTCSend", "idBtn_SAOTCSend", "sendCodeButton",
+                    ),
+                    include_links=True,
+                )
+                if not clicked:
+                    clicked = await _click_primary_submit(page)
+                if not clicked:
+                    await proof_input.press("Enter")
+                state["email_submitted"] = True
+                state["code_requested_at"] = time.time()
+                print(f"  {tag} [graph] resumed saved recovery mailbox; sent code")
+                await asyncio.sleep(2)
+                return True, True
+            except Exception as exc:
+                print(f"  {tag} [graph] saved recovery mailbox submit failed: {str(exc)[:120]}")
+                return True, False
+        if not state.get("proof_confirmation_logged"):
+            state["proof_confirmation_logged"] = True
+            state["unrecoverable_proof"] = True
+            print(
+                f"  {tag} [graph] existing proof email confirmation is visible; "
+                "no saved recovery mailbox is available"
+            )
+        return True, False
+    on_recovery_page = (
+        "/interrupt/credentialaction" in current_url
         or any(marker in current_url or marker in body for marker in markers)
+    )
+    # A submitted code must not keep claiming success after Microsoft has moved on.
+    # Otherwise the device loop treats every later page as a completed recovery action
+    # and never clicks the password, account, or consent controls.
+    if state.get("code_submitted") and not on_recovery_page:
+        return False, False
+    if not (
+        state.get("email_submitted") or state.get("code_task") or on_recovery_page
     ):
         return False, False
     state.setdefault("code_submitted", False)
     if state.get("code_submitted"):
-        return True, True
+        clicked = await _click_microsoft_action(
+            page,
+            labels=("continue", "next", "继续", "下一步", "ok", "done", "完成", "yes"),
+            preferred_ids=("iNext", "idSIButton9", "continueButton", "idSubmit_SAOTC"),
+            include_links=True,
+        )
+        if not clicked:
+            clicked = await _click_primary_submit(page)
+        if clicked:
+            if not state.get("post_verify_logged"):
+                state["post_verify_logged"] = True
+                print(f"  {tag} [graph] continued after recovery email")
+                await asyncio.sleep(2)
+            return True, True
+        return False, False
 
-    email_input = page.locator(
-        'input[type="email"], input[name*="email" i], input[id*="email" i], '
-        'input[name*="address" i], input[id*="address" i]'
-    ).first
-    try:
-        has_email = await email_input.count() > 0 and await email_input.is_visible()
-    except Exception:
-        has_email = False
-    if has_email and not state.get("email_submitted"):
+    email_form = (
+        "we'll send codes" in body
+        or "we will send codes" in body
+        or "security alerts for your microsoft account" in body
+    )
+    code_page_markers = (
+        "enter the code", "enter code", "security code", "verification code",
+        "we sent a code", "code we sent", "check your email",
+        "输入验证码", "输入代码", "验证码",
+    )
+    # Microsoft's email-entry step is titled "Enter your code" but its body says
+    # "If <addr> matches the email address on your account, we'll send you a code".
+    # Treating that as a code page skipped the email input, so the form never
+    # advanced and no code was ever requested.
+    email_entry_page = (
+        "matches the email address on your account" in body
+        or "we'll send you a code" in body
+        or "we will send you a code" in body
+        or "votre adresse e-mail correspond" in body
+        or "le enviaremos un código" in body
+    )
+    code_page = (not email_entry_page) and any(
+        marker in body for marker in code_page_markers
+    )
+    email_input = None
+    if not (state.get("email_submitted") and code_page and not email_entry_page):
+        email_input = await _first_visible(page.locator(
+            'input[type="email"], input[name*="email" i], input[id*="email" i], '
+            'input[name*="address" i], input[id*="address" i], '
+            'input[id^="floatingLabelInput" i]'
+        ))
+    if email_input is None and email_form:
+        email_input = await _first_visible(page.locator(
+            'input[type="text"], input:not([type])'
+        ))
+    has_email = email_input is not None
+    if has_email:
         if not state.get("mailbox"):
             try:
-                from common.mailbox import create_graph_recovery_mailbox
-                state["mailbox"] = await asyncio.to_thread(
+                from common.mailbox import (
                     create_graph_recovery_mailbox,
-                    provider,
-                    _graph_recovery_outlook_mailbox(),
+                    restore_graph_recovery_mailbox,
                 )
+                # Prefer the address already bound to this account; minting a
+                # fresh mailbox each attempt leaves several extra recovery
+                # addresses on the account and blocks the real one.
+                if account_email:
+                    state["mailbox"] = await asyncio.to_thread(
+                        restore_graph_recovery_mailbox, account_email
+                    )
+                if not state.get("mailbox"):
+                    state["mailbox"] = await asyncio.to_thread(
+                        create_graph_recovery_mailbox,
+                        provider,
+                        _graph_recovery_outlook_mailbox(),
+                    )
+                if account_email:
+                    from common.mailbox import remember_graph_recovery_mailbox
+
+                    await asyncio.to_thread(
+                        remember_graph_recovery_mailbox,
+                        account_email,
+                        state["mailbox"],
+                    )
                 print(f"  {tag} [graph] binding recovery email via {state['mailbox']['provider']}: "
                       f"{state['mailbox']['email']}")
             except Exception as exc:
                 print(f"  {tag} [graph] recovery mailbox create failed: {str(exc)[:140]}")
                 return True, False
+        attempts = int(
+            state.get("email_submit_attempts")
+            or (1 if state.get("email_submitted") else 0)
+        )
+        if state.get("email_submitted") and attempts >= 3:
+            state["recovery_email_submit_stalled"] = True
+            diagnostics = await _recovery_email_form_diagnostics(page)
+            print(
+                f"  {tag} [graph] recovery email form stayed open after "
+                f"{attempts} submissions"
+            )
+            print(f"  {tag} [graph] recovery email form diagnostics: {diagnostics}")
+            return True, False
         try:
             await email_input.fill(state["mailbox"]["email"])
             clicked = await _click_microsoft_action(
-                page, preferred_ids=(
+                page,
+                labels=(
+                    "next", "send code", "send a code", "continue",
+                    "下一步", "发送代码", "发送验证码", "email me a code",
+                ),
+                negative_labels=(),
+                preferred_ids=(
                     "iNext", "idSubmit_SAOTCSend", "idBtn_SAOTCSend",
                     "idSubmit_SAOTC", "idBtn_SAOTC", "continueButton",
-                )
+                ),
+                include_links=True,
             )
             if not clicked:
+                clicked = await _click_primary_submit(page)
+            if not clicked:
                 await email_input.press("Enter")
+                clicked = "enter"
             state["email_submitted"] = True
+            state["email_submit_attempts"] = attempts + 1
+            state["email_submit_action"] = str(clicked or "")[:80]
             state["code_requested_at"] = time.time()
+            if attempts:
+                print(
+                    f"  {tag} [graph] recovery email form did not advance; "
+                    f"resubmitted ({attempts + 1}/3)"
+                )
             await asyncio.sleep(2)
             return True, True
         except Exception as exc:
             print(f"  {tag} [graph] recovery email submit failed: {str(exc)[:120]}")
             return True, False
 
-    code_input = page.locator(
+    code_input = await _first_visible(page.locator(
         'input[autocomplete="one-time-code"], input[name*="otc" i], input[id*="otc" i], '
         'input[name*="code" i], input[id*="code" i], input[name*="ott" i], input[id*="ott" i]'
-    ).first
-    try:
-        has_code = await code_input.count() > 0 and await code_input.is_visible()
-    except Exception:
-        has_code = False
+    ))
+    if (
+        code_input is None
+        and state.get("email_submitted")
+        and not email_entry_page
+        and (code_page or (not email_form and "code" in body))
+    ):
+        code_input = await _first_visible(page.locator(
+            'input[id^="floatingLabelInput" i], input[type="text"]'
+        ))
+    has_code = code_input is not None
+    add_email_intro = (
+        "add an email" in body
+        or "add email" in body
+        or "help protect your account" in body
+        or "pomagajte zascititi" in body
+        or "pomagajte zaščititi" in body
+        or "dodajte e-postni" in body
+        or "dodajte e-poštni" in body
+    )
+    if not has_email and not state.get("email_submitted") and add_email_intro:
+        clicked = await _click_microsoft_action(
+            page,
+            labels=(
+                "add email", "add an email", "add an email address",
+                "メールの追加", "メールアドレスを追加",
+                "添加电子邮件", "添加邮箱",
+            ),
+            negative_labels=(),
+            include_links=True,
+        )
+        if not clicked:
+            clicked = await _click_primary_submit(page)
+        if clicked:
+            state["add_email_opened"] = True
+            attempts = int(state.get("add_email_attempts") or 0) + 1
+            state["add_email_attempts"] = attempts
+            print(f"  {tag} [graph] opening add-email form (attempt {attempts})")
+            await asyncio.sleep(2)
+            return True, True
+
     if not has_code:
         return True, False
     if not state.get("code_task"):
         from common.mailbox import poll_graph_recovery_code
         mailbox = state.get("mailbox")
         if not mailbox:
+            if await _return_to_recovery_email_form(page, state, tag):
+                return True, True
             print(f"  {tag} [graph] recovery code page has no mailbox state")
             return True, False
         state["code_task"] = asyncio.create_task(asyncio.to_thread(
@@ -1481,6 +1961,7 @@ async def _bind_required_recovery_email(page, state, idx=0):
             max_wait=timeout,
             poll_interval=interval,
             received_after=state.get("code_requested_at"),
+            exclude_codes=state.get("rejected_codes", ()),
         ))
         return True, True
     task = state["code_task"]
@@ -1492,18 +1973,85 @@ async def _bind_required_recovery_email(page, state, idx=0):
         print(f"  {tag} [graph] recovery code poll failed: {str(exc)[:120]}")
         return True, False
     if not code:
-        print(f"  {tag} [graph] recovery code timed out")
+        if int(state.get("code_retry_count") or 0) >= 1:
+            state["recovery_code_delivery_timeout"] = True
+            print(f"  {tag} [graph] recovery code delivery timed out after resend")
+            return True, False
+        if await _return_to_recovery_email_form(page, state, tag):
+            return True, True
+        if not state.get("code_timeout_logged"):
+            print(f"  {tag} [graph] recovery code timed out")
+            state["code_timeout_logged"] = True
         return True, False
     try:
-        await code_input.fill(str(code))
-        clicked = await _click_microsoft_action(
-            page, preferred_ids=("iNext", "idSubmit_SAOTC", "idBtn_SAOTC", "continueButton")
-        )
-        if not clicked:
-            await code_input.press("Enter")
+        boxes = await _recovery_code_boxes(page)
+        digits = "".join(ch for ch in str(code) if ch.isdigit())
+        # A rejected code stays in Microsoft's boxes until cleared, so refilling
+        # them is a no-op and the resent code keeps showing the old error.
+        for box in boxes:
+            with contextlib.suppress(Exception):
+                await box.fill("")
+        with contextlib.suppress(Exception):
+            await code_input.fill("")
+        if len(boxes) >= 4 and len(digits) >= len(boxes):
+            try:
+                await boxes[0].focus()
+                await page.keyboard.type(digits, delay=60)
+            except Exception:
+                pass
+            for box, digit in zip(boxes, digits):
+                try:
+                    if await box.input_value() != digit:
+                        await box.fill(digit)
+                except Exception:
+                    pass
+            clicked = await _click_primary_submit(page)
+            if not clicked:
+                clicked = await _click_microsoft_action(
+                    page, preferred_ids=("iNext", "idSubmit_SAOTC", "idBtn_SAOTC", "continueButton")
+                )
+            if not clicked:
+                with contextlib.suppress(Exception):
+                    await boxes[-1].press("Enter", timeout=1000)
+        else:
+            # Single-field OTP forms do not always submit on fill(); when the
+            # Enter/submit click is a no-op the loop used to return "verified"
+            # on an unsubmitted code and then idle until the device code expired.
+            await code_input.fill(str(code))
+            clicked = await _click_microsoft_action(
+                page, preferred_ids=("iNext", "idSubmit_SAOTC", "idBtn_SAOTC", "continueButton")
+            )
+            if not clicked:
+                try:
+                    await code_input.press("Enter")
+                except Exception:
+                    pass
         state["code_submitted"] = True
         print(f"  {tag} [graph] recovery email verified")
         await asyncio.sleep(2)
+        try:
+            page_text = " ".join(
+                (await page.locator("body").inner_text(timeout=3000)).split()
+            )
+        except Exception:
+            page_text = ""
+        still_on_code_page = bool(
+            _recovery_code_was_rejected(page_text)
+            or re.search(r"enter your code|we sent a code|code we sent", page_text, re.I)
+        )
+        if still_on_code_page:
+            state["code_submit_unconfirmed"] = int(state.get("code_submit_unconfirmed") or 0) + 1
+            print(
+                f"  {tag} [graph] recovery code not accepted yet "
+                f"(attempt {state['code_submit_unconfirmed']}/2); page still shows the code form"
+            )
+            if state["code_submit_unconfirmed"] >= 2:
+                return True, await _resend_rejected_recovery_code(page, state, tag)
+            # Let the loop re-read the page and retry the submit.
+            state["code_submitted"] = False
+            state.pop("code_task", None)
+            state["code_requested_at"] = time.time()
+            return True, True
         return True, True
     except Exception as exc:
         print(f"  {tag} [graph] recovery code submit failed: {str(exc)[:120]}")
@@ -1594,9 +2142,29 @@ async def _accept_microsoft_app_consent(page, idx=0):
     )
     if not detected:
         return False, False
-    clicked = await _click_microsoft_action(
-        page, preferred_ids=("idBtn_Accept", "acceptButton", "iAgree", "idSIButton9"),
-    )
+    # The consent interstitial often paints its text before the Accept button is
+    # enabled (it stays aria-disabled while the app metadata loads). Clicking once
+    # and giving up leaves the device code to expire, so poll for up to ~15s.
+    clicked = ""
+    for wait_index in range(10):
+        clicked = await _click_microsoft_action(
+            page,
+            preferred_ids=("idBtn_Accept", "acceptButton", "iAgree", "idSIButton9"),
+            labels=(
+                "accept", "allow", "continue", "agree",
+                "accepter", "autoriser", "continuer", "aceptar", "permitir", "continuar",
+                "akzeptieren", "zulassen", "weiter", "aceitar", "accetta", "consenti",
+                "accepteren", "toestaan", "zaakceptuj", "принять", "продолжить",
+                "kabul et", "接受", "同意", "继续", "承認", "동의", "계속",
+                "izinkan", "lanjutkan", "sprejmi", "nadaljuj",
+            ),
+            include_links=False,
+        )
+        if clicked:
+            break
+        if wait_index == 0:
+            print(f"  {tag} [graph] app consent detected; waiting for Accept control")
+        await asyncio.sleep(1.5)
     if clicked:
         print(f"  {tag} [graph] accepted Microsoft app consent")
         await asyncio.sleep(2)
@@ -1638,6 +2206,7 @@ async def _handle_microsoft_kmsi(page, idx=0):
         "साइन इन रहने दें", "साइन इन बनाए रखें", "साइन इन रहें",
         "क्या आप साइन इन रहना चाहते हैं",
         "tetap masuk", "biarkan saya tetap masuk",
+        "ostati vpisani", "ostati prijavljeni",
     )
     detected = "/kmsi" in current_url or any(marker in body for marker in markers)
     if not detected:
@@ -1651,6 +2220,54 @@ async def _handle_microsoft_kmsi(page, idx=0):
         return True, True
     print(f"  {tag} [graph] stay-signed-in prompt detected; action not ready")
     return True, False
+
+
+
+async def _accept_terms_update(page, tag):
+    """Check a required box and continue Microsoft's terms-update interstitial."""
+    try:
+        body = " ".join((await page.locator("body").inner_text(timeout=2000)).split()).lower()
+    except Exception:
+        return False
+    markers = (
+        "updating our terms", "atnaujiname", "salygas", "paslaug",
+        "posodabljamo", "pogoje uporabe",
+        "conditions d'utilisation", "nutzungsbedingungen", "términos",
+        "termos de uso", "условия использования", "服务条款", "使用条款",
+        "更新我们的条款", "we're updating",
+    )
+    if not any(marker in body for marker in markers):
+        return False
+    boxes = page.locator('input[type="checkbox"], [role="checkbox"]')
+    try:
+        count = await boxes.count()
+    except Exception:
+        count = 0
+    checked = 0
+    for index in range(count):
+        box = boxes.nth(index)
+        try:
+            if not await box.is_visible() or await box.is_checked():
+                continue
+            await box.click(force=True)
+            checked += 1
+        except Exception:
+            continue
+    clicked = await _click_microsoft_action(
+        page, preferred_ids=("idSIButton9", "idBtn_Accept", "iNext", "acceptButton"),
+    )
+    if not clicked:
+        submit = page.locator('button[type="submit"], input[type="submit"]').last
+        try:
+            if await submit.count() > 0 and await submit.is_visible() and await submit.is_enabled():
+                await submit.click()
+                clicked = "submit"
+        except Exception:
+            clicked = ""
+    if checked or clicked:
+        print(f"  {tag} [graph] accepted terms update")
+        return True
+    return False
 
 
 async def _extract_graph_token_device(page, email, password, idx=0):
@@ -1686,7 +2303,11 @@ async def _extract_graph_token_device(page, email, password, idx=0):
     password_submitted = False
     recovery_state = {}
     idle_rounds = 0
-    for _ in range(max(30, recovery_timeout // 2 + 15)):
+    empty_response_hits = 0
+    press_count = 0
+    hold_unavailable = 0
+    loop_deadline = time.monotonic() + max(180, recovery_timeout + 60)
+    while time.monotonic() < loop_deadline:
         state, token_data = await asyncio.to_thread(
             _exchange_graph_device_code, device["device_code"]
         )
@@ -1700,12 +2321,39 @@ async def _extract_graph_token_device(page, email, password, idx=0):
             return None
 
         terminal_error, terminal_body = await _microsoft_page_terminal_error(page)
+        if "all done" in terminal_body.lower() or "signed in to thunderbird" in terminal_body.lower():
+            for _ in range(12):
+                st, tok = await asyncio.to_thread(_exchange_graph_device_code, device["device_code"])
+                if st == "ready":
+                    print(f"  {tag} [graph] device authorization OK (confirmed on All-done page)! refresh_token=yes")
+                    return tok
+                await asyncio.sleep(1)
         if terminal_error:
             print(
                 f"  {tag} [graph] terminal sign-in error ({terminal_error}): "
                 f"{terminal_body[:180]}"
             )
             return {"terminal_error": terminal_error}
+        if "ERR_EMPTY_RESPONSE" in terminal_body:
+            empty_response_hits += 1
+            if empty_response_hits >= 2:
+                print(f"  {tag} [graph] device page empty response, giving up")
+                return None
+        else:
+            empty_response_hits = 0
+
+        if (
+            recovery_state.get("code_submitted")
+            and _recovery_code_was_rejected(terminal_body)
+        ):
+            retried = await _resend_rejected_recovery_code(
+                page, recovery_state, tag
+            )
+            if recovery_state.get("recovery_code_rejected"):
+                print(f"  {tag} [graph] recovery email verification failed after resend")
+                return {"terminal_error": "recovery_code_rejected"}
+            if retried:
+                continue
 
         kmsi_page, kmsi_accepted = await _handle_microsoft_kmsi(page, idx)
         consent_page = consent_accepted = False
@@ -1721,14 +2369,71 @@ async def _extract_graph_token_device(page, email, password, idx=0):
             recovery_enabled, _, _, _ = _graph_recovery_settings()
             if recovery_enabled:
                 recovery_page, recovery_bound = await _bind_required_recovery_email(
-                    page, recovery_state, idx
+                    page, recovery_state, idx, email
                 )
+                if recovery_state.get("unrecoverable_proof"):
+                    print(f"  {tag} [graph] existing recovery mailbox cannot be restored")
+                    return {"terminal_error": "recovery_mailbox_unavailable"}
+                if recovery_state.get("recovery_code_rejected"):
+                    print(f"  {tag} [graph] recovery email verification failed after resend")
+                    return {"terminal_error": "recovery_code_rejected"}
+                if recovery_state.get("recovery_code_delivery_timeout"):
+                    print(f"  {tag} [graph] recovery code was not delivered after resend")
+                    return {"terminal_error": "recovery_code_delivery_timeout"}
+                if recovery_state.get("recovery_email_submit_stalled"):
+                    print(f"  {tag} [graph] recovery email form did not advance")
+                    return {"terminal_error": "recovery_email_submit_stalled"}
             if not recovery_page:
                 recovery_page, recovery_bound = await _skip_optional_recovery_email(
                     page, idx
                 )
         acted = kmsi_accepted or consent_accepted or passkey_skipped or recovery_bound
+        if acted:
+            loop_deadline = max(loop_deadline, time.monotonic() + 90)
         optional_setup_page = kmsi_page or consent_page or passkey_page or recovery_page
+        # Microsoft issues a PerimeterX / Arkose hold challenge after the
+        # device code.  Without the shared hold helper this branch never
+        # fires and the device code silently expires.
+        hold_visible = (
+            press_count < 4
+            and not optional_setup_page
+            and await _outlook_press.captcha_visible(page)
+        )
+        if hold_visible and not acted:
+            hold_result = await _outlook_press.press_and_hold(
+                page, label=tag, press_number=press_count + 1,
+            )
+            if hold_result:
+                press_count += 1
+                acted = bool(hold_result.get("passed"))
+                if not acted:
+                    if press_count >= 4:
+                        body = ""
+                        try:
+                            body = " ".join(
+                                (await page.locator("body").inner_text(timeout=3000)).split()
+                            )
+                        except Exception:
+                            pass
+                        print(
+                            f"  {tag} [graph] hold challenge failed {press_count} times; "
+                            f"stopping without waiting for device-code expiry: {body[:160]}"
+                        )
+                        return {"terminal_error": "hold_challenge_failed", "body": body[:240]}
+                    await asyncio.sleep(random.uniform(2.5, 4.5))
+            else:
+                hold_unavailable += 1
+                if hold_unavailable >= 3:
+                    print(f"  {tag} [graph] hold challenge has no target; skipping")
+                    return {"terminal_error": "hold_challenge_unavailable"}
+                await asyncio.sleep(2)
+            continue
+        if hold_visible:
+            # Do not fight the hold frame by submitting the credential form
+            # behind it; wait for the next round instead.
+            await asyncio.sleep(1.5)
+            continue
+
         if not acted and not optional_setup_page and not email_submitted:
             email_input = page.locator('input[type="email"], input[name="loginfmt"]').first
             try:
@@ -1778,11 +2483,45 @@ async def _extract_graph_token_device(page, email, password, idx=0):
                 pass
 
         if not acted and not optional_setup_page:
+            acted = await _accept_terms_update(page, tag)
+        if not acted and not optional_setup_page:
             clicked = await _click_microsoft_action(
                 page, preferred_ids=("idSIButton9", "idBtn_Accept", "iNext", "acceptButton"),
             )
             acted = bool(clicked)
 
+        try:
+            page_body = " ".join(
+                (await page.locator("body").inner_text(timeout=3000)).split()
+            ).lower()
+        except Exception:
+            page_body = ""
+        if "reached your limit with this sign-in method" in page_body:
+            password_route = await _click_microsoft_action(
+                page,
+                labels=("use your password", "sign in with your password",
+                        "use a password", "use password", "password"),
+                negative_labels=(),
+                preferred_ids=("idA_PWD_SwitchToPassword", "switchToPassword"),
+                include_links=True,
+            )
+            if not password_route:
+                pwd_link = await _first_visible(page.locator(
+                    'a:has-text("Use your password"), button:has-text("Use your password"), [aria-label*="password" i]'
+                ))
+                if pwd_link:
+                    with contextlib.suppress(Exception):
+                        await pwd_link.click()
+                        password_route = "pwd-link"
+            if password_route:
+                print(f"  {tag} [graph] sign-in method limited; switched to password")
+                password_submitted = False
+                recovery_state.clear()
+                await asyncio.sleep(2)
+                continue
+            print(f"  {tag} [graph] sign-in method limited; no password route")
+            return {"terminal_error": "signin_method_limited",
+                    "body": page_body[:240]}
         idle_rounds = 0 if acted else idle_rounds + 1
         if idle_rounds >= 3:
             try:
@@ -1793,6 +2532,15 @@ async def _extract_graph_token_device(page, email, password, idx=0):
                 body = ""
             if body:
                 print(f"  {tag} [graph] device page waiting: {body[:180]}")
+            if recovery_state.get("code_submitted") and not optional_setup_page:
+                try:
+                    inputs_count = await page.locator("input:visible, button:visible").count()
+                    if inputs_count <= 2:
+                        print(f"  {tag} [graph] blank/stalled card after recovery code; reloading...")
+                        await page.reload(wait_until="domcontentloaded", timeout=20000)
+                        await asyncio.sleep(2)
+                except Exception as exc:
+                    print(f"  {tag} [graph] card reload error: {exc}")
             idle_rounds = 0
         await asyncio.sleep(2)
     try:

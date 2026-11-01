@@ -23,6 +23,73 @@ from config import (
     CLOAK_USER_DATA_DIR,
 )
 
+def _launch_geoip_fallback(exc: Exception) -> tuple[str | None, str | None] | None:
+    """Resolve locale/timezone without cloakbrowser's GeoIP module.
+
+    The bundled resolver uses third-party IP echo endpoints with a hard 20 s
+    deadline.  Residential gateways frequently stall those calls even though
+    the proxy itself works, which aborts the whole launch.  This fallback
+    queries the exit IP through the same proxy (several providers) and then
+    reads the bundled MaxMind database directly.
+    """
+    message = str(exc).lower()
+    if "geoip" not in message and "exit ip" not in message:
+        return None
+    import config as cfg
+
+    try:
+        from common import direct_proxy
+
+        proxy = direct_proxy.configured_proxy()
+        proxy_url = proxy.url if proxy else None
+    except Exception:
+        proxy_url = None
+    import requests
+
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    ip = None
+    for url in (
+        "https://api.ipify.org?format=json",
+        "https://ipinfo.io/json",
+        "https://ipwho.is/",
+        "https://checkip.amazonaws.com",
+        "https://api.ipify.org",
+    ):
+        try:
+            resp = requests.get(url, proxies=proxies, timeout=8)
+            resp.raise_for_status()
+            body = resp.text.strip()
+            if body.startswith("{"):
+                import json
+
+                payload = json.loads(body)
+                ip = payload.get("ip") or payload.get("query") or payload.get("IP")
+            else:
+                ip = body.split()[0]
+            if ip:
+                break
+        except Exception:
+            continue
+    if not ip:
+        print("  CloakBrowser GeoIP fallback: exit IP unavailable; using fixed locale")
+        return ("America/Los_Angeles" if not proxy_url else None, "en-US")
+    try:
+        from cloakbrowser import geoip as cloak_geoip
+
+        db_path = cloak_geoip._ensure_geoip_db()  # type: ignore[attr-defined]
+        import geoip2.database
+
+        with geoip2.database.Reader(str(db_path)) as reader:
+            resp = reader.city(ip)
+            timezone = resp.location.time_zone
+            country = resp.country.iso_code
+            locale = cloak_geoip.COUNTRY_LOCALE_MAP.get(country)  # type: ignore[attr-defined]
+        print(f"  CloakBrowser GeoIP fallback: {ip} -> {country} {timezone or ''}")
+        return timezone, locale or "en-US"
+    except Exception as inner:
+        print(f"  CloakBrowser GeoIP fallback failed: {type(inner).__name__}; using fixed locale")
+        return (None, "en-US")
+
 
 def _proxy_url(browser_options: dict | None = None) -> str | None:
     options = dict(browser_options or {})
@@ -83,28 +150,50 @@ class CloakBrowserHandle:
         if CLOAK_FINGERPRINT_SEED:
             args.append(f"--fingerprint={CLOAK_FINGERPRINT_SEED.strip()}")
         proxy = _proxy_url(browser_options)
+        locale = CLOAK_LOCALE.strip() or "en-US"
+        language_header = f"{locale},en;q=0.9"
         options = {
             "headless": bool(CLOAK_HEADLESS),
             "humanize": bool(CLOAK_HUMANIZE),
             "geoip": bool(CLOAK_GEOIP),
+            "locale": locale,
+            "extra_http_headers": {"Accept-Language": language_header},
         }
         if proxy:
             options["proxy"] = proxy
         if args:
             options["args"] = args
-        if CLOAK_LOCALE.strip():
-            options["locale"] = CLOAK_LOCALE.strip()
         if CLOAK_TIMEZONE.strip():
             options["timezone"] = CLOAK_TIMEZONE.strip()
         if CLOAK_LICENSE_KEY.strip():
             options["license_key"] = CLOAK_LICENSE_KEY.strip()
 
         user_data_dir = CLOAK_USER_DATA_DIR.strip()
-        try:
+
+        async def _launch(**opts):
             if user_data_dir:
-                context = await launch_persistent_context_async(user_data_dir, **options)
-            else:
-                context = await launch_context_async(**options)
+                return await launch_persistent_context_async(user_data_dir, **opts)
+            return await launch_context_async(**opts)
+
+        try:
+            context = await _launch(**options)
+        except RuntimeError as exc:
+            # cloakbrowser's GeoIP resolver aborts the launch when its IP echo
+            # services stall behind the residential gateway. Resolve the
+            # locale ourselves and keep the native fingerprint.
+            fallback = _launch_geoip_fallback(exc) if options.get("geoip") else None
+            if fallback is None:
+                raise
+            timezone, resolved_locale = fallback
+            options["geoip"] = False
+            if resolved_locale:
+                options["locale"] = resolved_locale
+                options["extra_http_headers"] = {
+                    "Accept-Language": resolved_locale + ",en;q=0.9"
+                }
+            if timezone:
+                options["timezone"] = timezone
+            context = await _launch(**options)
         except ImportError as exc:
             # geoip2 is optional. Cloak's native fingerprint remains usable
             # without automatic language/timezone lookup.

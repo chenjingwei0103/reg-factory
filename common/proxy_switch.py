@@ -25,7 +25,10 @@ except Exception:
     pass
 
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 CLASH_API = os.environ.get("CLASH_API", "http://127.0.0.1:9097")
 CLASH_SECRET = os.environ.get("CLASH_SECRET", "")

@@ -155,6 +155,19 @@ def authorize_one(
             )
             result = None
     if not result or not result.get("refresh_token"):
+        terminal_error = str((result or {}).get("terminal_error") or "").strip().lower()
+        if terminal_error:
+            print(
+                f"[authorize {index}] {email}: terminal sign-in stop ({terminal_error})",
+                flush=True,
+            )
+        if terminal_error == "account_locked":
+            print(
+                f"[authorize {index}] {email}: account locked by Microsoft; "
+                "not queued for retry",
+                flush=True,
+            )
+            return None
         print(f"[authorize {index}] {email}: {selected_method} authorization failed", flush=True)
         record_pending_account(item, environ)
         return None
@@ -244,17 +257,22 @@ def main() -> int:
         return authorize_one(account, index, proxy, args.method, os.environ)
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.concurrency, len(accounts))) as pool:
         futures = [pool.submit(_submit, account, index) for index, account in enumerate(accounts, 1)]
-        results = [result for future in futures if (result := future.result())]
+        results = []
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if not result:
+                continue
+            results.append(result)
+            if args.no_update_pool:
+                continue
+            from common.outlook_recovery import upsert_refresh_tokens
 
-    if results and not args.no_update_pool:
-        from common.outlook_recovery import upsert_refresh_tokens
-
-        update = upsert_refresh_tokens(results)
-        print(
-            f"[authorize] pool updated: updated={update['updated']} appended={update['appended']} "
-            f"errors_cleared={update['errors_cleared']}",
-            flush=True,
-        )
+            update = upsert_refresh_tokens([result])
+            print(
+                f"[authorize] pool updated: updated={update['updated']} appended={update['appended']} "
+                f"errors_cleared={update['errors_cleared']}",
+                flush=True,
+            )
     print(f"[authorize] complete: {len(results)}/{len(accounts)} authorized")
     return 0 if len(results) == len(accounts) else 1
 

@@ -61,6 +61,66 @@ def looks_like_refusal(text):
     return any(m in t for m in _REFUSAL_MARKERS)
 
 
+def _preview_model_text(text, limit=500):
+    collapsed = " ".join(str(text or "").split())
+    if not collapsed:
+        return "<empty>"
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[:limit] + "..."
+
+
+def _log_model_http(model, response):
+    try:
+        body = _preview_model_text(getattr(response, "text", ""), 240)
+    except Exception:
+        body = "<unreadable>"
+    print(f"  [vote] {model} HTTP {getattr(response, 'status_code', '?')}: {body}")
+
+
+def _log_unusable_model_text(model, text):
+    if not text:
+        print(f"  [vote] {model} empty content", flush=True)
+        return
+    print(f"  [vote] {model} refusal: {_preview_model_text(text)}", flush=True)
+
+
+def _response_body(response):
+    try:
+        return getattr(response, "text", "") or ""
+    except Exception:
+        return "<unreadable>"
+
+
+def _log_openai_content(model, response):
+    """Print the model payload before parsing. Returns message.content unchanged."""
+    raw = _response_body(response)
+    try:
+        message = response.json()["choices"][0]["message"]
+    except Exception as error:
+        print(
+            f"  [vote] {model} raw-body: {_preview_model_text(raw, 800)} parse={error}",
+            flush=True,
+        )
+        raise
+    content = message.get("content") if isinstance(message, dict) else message
+    if content in (None, ""):
+        detail = ""
+        if isinstance(message, dict):
+            detail = " keys=" + ",".join(str(key) for key in message.keys())
+            for key in ("reasoning_content", "reasoning", "refusal"):
+                value = message.get(key)
+                if value:
+                    detail += f" {key}={_preview_model_text(value, 400)}"
+        print(f"  [vote] {model} raw=<empty>{detail}", flush=True)
+    else:
+        print(
+            f"  [vote] {model} raw={_preview_model_text(content, 800)}",
+            flush=True,
+        )
+    return content
+
+
 def _load_keys():
     keys = []
     if VISION_API_KEY:
@@ -91,6 +151,28 @@ def _model_for_key(key, model):
     return model
 
 
+def _ask_openai_with_chrome_tls(endpoint, key, real_model, payload):
+    """Retry one OpenAI-compatible request with Chrome-like TLS when requests fails."""
+    from curl_cffi import requests as curl_requests
+
+    response = curl_requests.post(
+        endpoint,
+        impersonate="chrome131",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=35,
+    )
+    if response.status_code != 200:
+        _log_model_http(real_model, response)
+        return None
+    text = _log_openai_content(real_model, response)
+    if looks_like_refusal(text):
+        _log_unusable_model_text(real_model, text)
+        return None
+    print(f"  [vision] {real_model} recovered through Chrome TLS", flush=True)
+    return text
+
+
 def ask_vision(prompt, image_b64, models=None, keys=None, max_tokens=900, temperature=0.0):
     """把 prompt + 图片发给视觉 LLM，返回文本答案或 None。按 models 降级、按 keys 轮换。"""
     models = models or ([PRIMARY_MODEL] + FALLBACK_MODELS)
@@ -109,26 +191,53 @@ def ask_vision(prompt, image_b64, models=None, keys=None, max_tokens=900, temper
     for model in models:
         for ki, key in enumerate(keys):
             real_model = _model_for_key(key, model)
-            try:
-                r = requests.post(
-                    _endpoint_for_key(key),
-                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                    json={"model": real_model, "messages": payload_msg,
-                          "max_tokens": max_tokens, "temperature": temperature},
-                    timeout=120,
-                )
-                if r.status_code == 200:
-                    txt = r.json()["choices"][0]["message"]["content"]
-                    if looks_like_refusal(txt):
-                        print(f"  [vision] {real_model} key#{ki} refused, next")
+            payload = {
+                "model": real_model,
+                "messages": payload_msg,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+            for attempt in range(1, 4):
+                try:
+                    r = requests.post(
+                        _endpoint_for_key(key),
+                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                        json=payload,
+                        timeout=120,
+                    )
+                    if r.status_code == 200:
+                        txt = _log_openai_content(real_model, r)
+                        if looks_like_refusal(txt):
+                            print(f"  [vision] {real_model} key#{ki} refused, next", flush=True)
+                            break
+                        return txt
+                    if r.status_code in (404, 429, 500, 502, 503):
+                        break
+                    print(f"  [vision] {real_model} key#{ki} -> {r.status_code} {r.text[:80]}")
+                    break
+                except Exception as e:
+                    print(
+                        f"  [vision] {real_model} key#{ki} err attempt {attempt}/3: {str(e)[:160]}",
+                        flush=True,
+                    )
+                    if attempt < 3:
+                        time.sleep(attempt)
                         continue
-                    return txt
-                if r.status_code in (404, 429, 500, 502, 503):
-                    continue
-                print(f"  [vision] {real_model} key#{ki} -> {r.status_code} {r.text[:80]}")
-            except Exception as e:
-                print(f"  [vision] {real_model} key#{ki} err: {str(e)[:60]}")
-                continue
+                    try:
+                        recovered = _ask_openai_with_chrome_tls(
+                            _endpoint_for_key(key),
+                            key,
+                            real_model,
+                            payload,
+                        )
+                        if recovered:
+                            return recovered
+                    except Exception as fallback_error:
+                        print(
+                            f"  [vision] {real_model} Chrome TLS fallback err: "
+                            f"{str(fallback_error)[:160]}",
+                            flush=True,
+                        )
     print("  [vision] 所有 model/key 都失败")
     return None
 
@@ -168,9 +277,21 @@ def _ask_one(base, key, model, prompt, image_b64, max_tokens=900):
                     timeout=20,
                 )
                 if r.status_code == 200:
-                    txt = "".join(b.get("text", "") for b in r.json().get("content", []))
+                    try:
+                        payload = r.json().get("content", [])
+                    except Exception as error:
+                        print(
+                            f"  [vote] {model} raw-body: {_preview_model_text(_response_body(r), 800)} parse={error}",
+                            flush=True,
+                        )
+                        raise
+                    txt = "".join(b.get("text", "") for b in payload if isinstance(b, dict))
+                    print(f"  [vote] {model} raw={_preview_model_text(txt or payload, 800)}", flush=True)
                     if txt and not looks_like_refusal(txt):
                         return txt
+                    _log_unusable_model_text(model, txt)
+                else:
+                    _log_model_http(model, r)
                 if r.status_code not in (408, 429, 500, 502, 503, 504):
                     return None
             else:
@@ -184,13 +305,16 @@ def _ask_one(base, key, model, prompt, image_b64, max_tokens=900):
                     timeout=20,
                 )
                 if r.status_code == 200:
-                    txt = r.json()["choices"][0]["message"]["content"]
-                    if not looks_like_refusal(txt):
+                    txt = _log_openai_content(model, r)
+                    if txt and not looks_like_refusal(txt):
                         return txt
+                    _log_unusable_model_text(model, txt)
+                else:
+                    _log_model_http(model, r)
                 if r.status_code not in (408, 429, 500, 502, 503, 504):
                     return None
         except Exception as e:
-            print(f"  [vote] {model} attempt {attempt}/3 err: {str(e)[:50]}")
+            print(f"  [vote] {model} attempt {attempt}/3 err: {str(e)[:120]}", flush=True)
         if attempt < 3:
             time.sleep(attempt)
     if not is_anthropic:
@@ -218,12 +342,15 @@ def _ask_one(base, key, model, prompt, image_b64, max_tokens=900):
                 timeout=35,
             )
             if r.status_code == 200:
-                txt = r.json()["choices"][0]["message"]["content"]
-                if not looks_like_refusal(txt):
-                    print(f"  [vote] {model} recovered through Chrome TLS")
+                txt = _log_openai_content(model, r)
+                if txt and not looks_like_refusal(txt):
+                    print(f"  [vote] {model} recovered through Chrome TLS", flush=True)
                     return txt
+                _log_unusable_model_text(model, txt)
+            else:
+                _log_model_http(model, r)
         except Exception as e:
-            print(f"  [vote] {model} Chrome TLS fallback err: {str(e)[:50]}")
+            print(f"  [vote] {model} Chrome TLS fallback err: {str(e)[:120]}", flush=True)
     return None
 
 
@@ -333,7 +460,7 @@ def vote_points(prompt, image_b64, max_tokens=900, deadline=55):
                 if pts:
                     froms.append(pts[0]); tos.append(pts[1])
                 raws.append((model, pts, (txt or "")[-160:]))
-                print(f"  [vote] {model} -> {pts}")
+                print(f"  [vote] {model} -> {pts} raw={_preview_model_text(txt, 800)}", flush=True)
         except cf.TimeoutError:
             for fut, model in futs.items():
                 if model not in done:
@@ -371,7 +498,7 @@ def vote_answer(prompt, image_b64, n_options, max_tokens=900, deadline=55):
                 if a is not None:
                     answers.append((model, a))
                 raws.append((model, a, (txt or "")[-120:]))
-                print(f"  [vote] {model} -> {a}")
+                print(f"  [vote] {model} -> {a} raw={_preview_model_text(txt, 800)}", flush=True)
         except cf.TimeoutError:
             for fut, model in futs.items():
                 if model not in done:
@@ -422,7 +549,7 @@ def vote_picklist(prompt, image_b64, n_options, max_tokens=900, deadline=55, min
                     for i in picks:
                         per_index[i] += 1
                 raws.append((model, picks, (txt or "")[-160:]))
-                print(f"  [vote] {model} -> PICK {picks}")
+                print(f"  [vote] {model} -> PICK {picks} raw={_preview_model_text(txt, 800)}", flush=True)
         except cf.TimeoutError:
             for fut, model in futs.items():
                 if model not in done:

@@ -165,6 +165,297 @@ class OutlookGraphFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(detected)
         self.assertTrue(skipped)
 
+    async def test_protect_account_page_opens_add_email_form(self):
+        page = MagicMock()
+        page.url = "https://account.live.com/proofs/Add"
+        page.frames = []
+        body = MagicMock()
+        body.inner_text = AsyncMock(
+            return_value=(
+                "Help protect your account Add an email so you can safely "
+                "sign in to your Microsoft account if you ever get locked out. "
+                "Learn more Add email"
+            )
+        )
+        hidden = MagicMock()
+        hidden.count = AsyncMock(return_value=0)
+        hidden.is_visible = AsyncMock(return_value=False)
+
+        def locator(selector):
+            if selector == "body":
+                return body
+            result = MagicMock()
+            result.first = hidden
+            return result
+
+        page.locator.side_effect = locator
+        page.evaluate = AsyncMock(return_value="add email")
+        with patch.object(
+            register_outlook_standalone, "_graph_recovery_settings",
+            return_value=(True, "cfmail", 120, 5),
+        ), patch.object(register_outlook_standalone.asyncio, "sleep", AsyncMock()):
+            detected, acted = await (
+                register_outlook_standalone._bind_required_recovery_email(page, {}, 1)
+            )
+
+        self.assertTrue(detected)
+        self.assertTrue(acted)
+        payload = page.evaluate.call_args.args[1]
+        self.assertIn("add email", payload["labels"])
+        self.assertTrue(payload["includeLinks"])
+
+    async def test_protect_account_retries_add_email_when_intro_did_not_advance(self):
+        page = MagicMock()
+        page.url = "https://account.live.com/proofs/Add"
+        page.frames = []
+        body = MagicMock()
+        body.inner_text = AsyncMock(
+            return_value=(
+                "Help protect your account Add an email so you can safely "
+                "sign in to your Microsoft account if you ever get locked out. "
+                "Learn more Add email"
+            )
+        )
+        hidden = MagicMock()
+        hidden.count = AsyncMock(return_value=0)
+        hidden.is_visible = AsyncMock(return_value=False)
+
+        def locator(selector):
+            if selector == "body":
+                return body
+            result = MagicMock()
+            result.first = hidden
+            return result
+
+        page.locator.side_effect = locator
+        page.evaluate = AsyncMock(return_value="add email")
+        with patch.object(
+            register_outlook_standalone, "_graph_recovery_settings",
+            return_value=(True, "cfmail", 120, 5),
+        ), patch.object(register_outlook_standalone.asyncio, "sleep", AsyncMock()):
+            detected, acted = await register_outlook_standalone._bind_required_recovery_email(
+                page, {"add_email_opened": True}, 3
+            )
+
+        self.assertTrue(detected)
+        self.assertTrue(acted)
+        self.assertTrue(page.evaluate.await_count)
+
+    async def test_localized_protect_account_page_clicks_submit_button(self):
+        page = MagicMock()
+        page.url = "https://account.live.com/interrupt/credentialaction"
+        page.frames = []
+        body = MagicMock()
+        body.inner_text = AsyncMock(
+            return_value="Pomagajte zascititi svoj racun Dodajte e-postni naslov"
+        )
+        submit = MagicMock()
+        submit.is_visible = AsyncMock(return_value=True)
+        submit.click = AsyncMock()
+        submit_locator = MagicMock()
+        submit_locator.count = AsyncMock(return_value=1)
+        submit_locator.nth = MagicMock(return_value=submit)
+        empty = MagicMock()
+        empty.count = AsyncMock(return_value=0)
+
+        def locator(selector):
+            if selector == "body":
+                return body
+            if selector == 'button[type="submit"], input[type="submit"]':
+                return submit_locator
+            return empty
+
+        page.locator.side_effect = locator
+        page.evaluate = AsyncMock(return_value="")
+        with patch.object(
+            register_outlook_standalone, "_graph_recovery_settings",
+            return_value=(True, "cfmail", 120, 5),
+        ), patch.object(register_outlook_standalone.asyncio, "sleep", AsyncMock()):
+            detected, acted = await (
+                register_outlook_standalone._bind_required_recovery_email(page, {}, 3)
+            )
+
+        self.assertTrue(detected)
+        self.assertTrue(acted)
+        submit.click.assert_awaited()
+        page.evaluate.assert_awaited_once()
+
+    async def test_existing_proof_confirmation_uses_stable_input(self):
+        page = MagicMock()
+        page.url = "https://login.live.com/oauth20_remoteconnect.srf"
+        page.frames = []
+        body = MagicMock()
+        body.inner_text = AsyncMock(
+            return_value="Verify your email We'll send a code to 87*****@example.test"
+        )
+        proof = MagicMock()
+        proof.is_visible = AsyncMock(return_value=True)
+        proof_locator = MagicMock()
+        proof_locator.count = AsyncMock(return_value=1)
+        proof_locator.nth = MagicMock(return_value=proof)
+
+        def locator(selector):
+            if selector == "body":
+                return body
+            if selector == "#proof-confirmation-email-input":
+                return proof_locator
+            empty = MagicMock()
+            empty.count = AsyncMock(return_value=0)
+            return empty
+
+        page.locator.side_effect = locator
+        with patch.object(
+            register_outlook_standalone, "_graph_recovery_settings",
+            return_value=(True, "cfmail", 120, 5),
+        ), patch.object(
+            register_outlook_standalone.asyncio, "to_thread",
+            AsyncMock(side_effect=AssertionError("must not create a new mailbox")),
+        ):
+            detected, acted = await (
+                register_outlook_standalone._bind_required_recovery_email(page, {}, 1)
+            )
+
+        self.assertTrue(detected)
+        self.assertFalse(acted)
+
+    async def test_floating_label_email_form_is_filled(self):
+        page = MagicMock()
+        page.url = "https://account.live.com/interrupt/credentialaction"
+        page.frames = []
+        body = MagicMock()
+        body.inner_text = AsyncMock(
+            return_value=(
+                "Add an email address We'll send codes and security alerts "
+                "for your Microsoft account to this email. We recommend using a "
+                "personal email, not a work or school one. Email Next"
+            )
+        )
+        email_input = MagicMock()
+        email_input.is_visible = AsyncMock(return_value=True)
+        email_input.fill = AsyncMock()
+        email_input.press = AsyncMock()
+        email_locator = MagicMock()
+        email_locator.count = AsyncMock(return_value=1)
+        email_locator.nth = MagicMock(return_value=email_input)
+        empty = MagicMock()
+        empty.count = AsyncMock(return_value=0)
+
+        def locator(selector):
+            if selector == "body":
+                return body
+            if "floatingLabelInput" in selector:
+                return email_locator
+            return empty
+
+        page.locator.side_effect = locator
+        page.evaluate = AsyncMock(return_value="next")
+        mailbox = {"provider": "cfmail", "email": "recovery@example.com"}
+        with patch.object(
+            register_outlook_standalone, "_graph_recovery_settings",
+            return_value=(True, "cfmail", 120, 5),
+        ), patch.object(
+            register_outlook_standalone.asyncio, "sleep", AsyncMock()
+        ), patch.object(
+            register_outlook_standalone.asyncio, "to_thread",
+            AsyncMock(return_value=mailbox),
+        ):
+            detected, acted = await (
+                register_outlook_standalone._bind_required_recovery_email(page, {}, 1)
+            )
+
+        self.assertTrue(detected)
+        self.assertTrue(acted)
+        email_input.fill.assert_awaited_with("recovery@example.com")
+
+    async def test_floating_label_code_is_submitted_after_email(self):
+        page = MagicMock()
+        page.url = "https://account.live.com/interrupt/credentialaction"
+        page.frames = []
+        body = MagicMock()
+        body.inner_text = AsyncMock(
+            return_value="Enter the code we sent to recovery@example.com Next"
+        )
+        code_input = MagicMock()
+        code_input.is_visible = AsyncMock(return_value=True)
+        code_input.fill = AsyncMock()
+        code_input.press = AsyncMock()
+        classic = MagicMock()
+        classic.count = AsyncMock(return_value=0)
+        floating = MagicMock()
+        floating.count = AsyncMock(return_value=1)
+        floating.nth = MagicMock(return_value=code_input)
+
+        def locator(selector):
+            if selector == "body":
+                return body
+            if "one-time-code" in selector:
+                return classic
+            if "floatingLabelInput" in selector:
+                return floating
+            return classic
+
+        page.locator.side_effect = locator
+        page.evaluate = AsyncMock(return_value="next")
+        task = asyncio.get_running_loop().create_future()
+        task.set_result("123456")
+        state = {
+            "email_submitted": True,
+            "mailbox": {"provider": "cfmail", "email": "recovery@example.com"},
+            "code_task": task,
+        }
+        with patch.object(
+            register_outlook_standalone, "_graph_recovery_settings",
+            return_value=(True, "cfmail", 120, 5),
+        ), patch.object(register_outlook_standalone.asyncio, "sleep", AsyncMock()):
+            detected, acted = await (
+                register_outlook_standalone._bind_required_recovery_email(page, state, 1)
+            )
+
+        self.assertTrue(detected)
+        self.assertTrue(acted)
+        code_input.fill.assert_awaited_with("123456")
+        self.assertTrue(state["code_submitted"])
+
+    async def test_verified_recovery_does_not_block_later_pages(self):
+        page = MagicMock()
+        page.url = "https://login.live.com/"
+        page.frames = []
+        body = MagicMock()
+        body.inner_text = AsyncMock(return_value="Enter password Sign in")
+        page.locator.return_value = body
+        state = {"email_submitted": True, "code_submitted": True}
+        with patch.object(
+            register_outlook_standalone, "_graph_recovery_settings",
+            return_value=(True, "cfmail", 120, 5),
+        ):
+            detected, acted = await (
+                register_outlook_standalone._bind_required_recovery_email(page, state, 1)
+            )
+
+        self.assertFalse(detected)
+        self.assertFalse(acted)
+
+    async def test_verified_recovery_page_clicks_continue_once(self):
+        page = MagicMock()
+        page.url = "https://account.live.com/proofs/Add"
+        page.frames = []
+        body = MagicMock()
+        body.inner_text = AsyncMock(return_value="Recovery email verified Next")
+        page.locator.return_value = body
+        page.evaluate = AsyncMock(return_value="next")
+        state = {"email_submitted": True, "code_submitted": True}
+        with patch.object(
+            register_outlook_standalone, "_graph_recovery_settings",
+            return_value=(True, "cfmail", 120, 5),
+        ), patch.object(register_outlook_standalone.asyncio, "sleep", AsyncMock()):
+            first = await register_outlook_standalone._bind_required_recovery_email(page, state, 1)
+            second = await register_outlook_standalone._bind_required_recovery_email(page, state, 1)
+
+        self.assertEqual(first, (True, True))
+        self.assertEqual(second, (True, True))
+        self.assertEqual(page.evaluate.await_count, 2)
+        self.assertTrue(state["post_verify_logged"])
+
     async def test_device_app_consent_clicks_accept_not_deny(self):
         page = MagicMock()
         page.url = "https://account.live.com/Consent/Update?mkt=EN-SG"

@@ -71,13 +71,36 @@ async def captcha_visible(page):
             box = await frames.nth(index).bounding_box()
             if _box_in_viewport(box, viewport, min_width=50, min_height=30):
                 return True
+
+        # Some sessions render the hold target without any #px-captcha node.
+        # Text on the visible challenge frame is enough to say "still pending".
+        for frame in page.frames:
+            try:
+                if "hsprotect.net" not in (frame.url or ""):
+                    continue
+                text = (await frame.evaluate("() => document.body ? document.body.innerText : ''")) or ""
+            except Exception:
+                continue
+            lowered = text.lower()
+            if any(marker in lowered for marker in (
+                "press and hold", "appuyer et maintenir", "halten",
+                "\u6309\u4f4f", "\u9577\u6309", "\u957f\u6309",
+                "\u62bc\u3057\u7d9a\u3051", "\ub204\ub974\uace0",
+            )):
+                return True
     except Exception:
         pass
     return False
 
 
 async def find_hold_target(page):
-    """Use the target lookup proven by the Outlook registration flow."""
+    """Locate the interactive hold button inside the live challenge frame.
+
+    The challenge is rendered inside one or more hsprotect.net frames at an
+    offset that bounding_box() does not translate.  The button geometry is
+    read inside the frame itself and converted to page coordinates, so the
+    physical press lands on the button rather than the frame edge.
+    """
     viewport = await _viewport_size(page)
     refresh_frames = getattr(page, "_refresh_frames", None)
     if refresh_frames:
@@ -85,27 +108,96 @@ async def find_hold_target(page):
             await refresh_frames(force=True)
         except Exception:
             pass
-    for frame in page.frames:
-        if frame == page.main_frame or "hsprotect.net" not in (frame.url or ""):
-            continue
-        try:
-            button = frame.locator("#px-captcha").first
-            if await button.count() > 0:
-                box = await button.bounding_box()
-                if _box_in_viewport(box, viewport, min_width=30, min_height=8):
-                    return box, True
-        except Exception:
-            pass
 
+    markers = (
+        "press and hold", "appuyer et maintenir", "halten",
+        "\u6309\u4f4f", "\u9577\u6309", "\u957f\u6309",
+        "\u62bc\u3057\u7d9a\u3051", "\ub204\ub974\uace0",
+    )
+    for frame in page.frames:
+        try:
+            if "hsprotect.net" not in (frame.url or ""):
+                continue
+            found = await frame.evaluate(r"""() => {
+                const nodes = [...document.querySelectorAll(
+                    '#px-captcha, button, [role="button"], div, span'
+                )];
+                let best = null;
+                for (const node of nodes) {
+                    const rect = node.getBoundingClientRect();
+                    if (rect.width < 40 || rect.height < 10) continue;
+                    const style = getComputedStyle(node);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+                    if (Number(style.opacity || '1') < 0.2) continue;
+                    const cursor = String(style.cursor || '').toLowerCase();
+                    const label = String(node.innerText || node.textContent || '')
+                        .trim().toLowerCase();
+                    const idMatch = node.id === 'px-captcha';
+                    const textMatch = label.includes('press and hold')
+                        || label.includes('appuyer')
+                        || label.includes('halten');
+                    if (!idMatch && !textMatch && cursor !== 'pointer') continue;
+                    const area = rect.width * rect.height;
+                    if (!best || area < best.area) {
+                        best = {
+                            x: rect.x, y: rect.y,
+                            width: rect.width, height: rect.height,
+                            area,
+                        };
+                    }
+                }
+                return best;
+            }""")
+            if not isinstance(found, dict):
+                continue
+            page_box = await _frame_page_box(page, frame)
+            if not page_box:
+                print("  [hold] frame without page box: " + (frame.url or "")[:70])
+                continue
+            box = {
+                "x": page_box["x"] + float(found["x"]),
+                "y": page_box["y"] + float(found["y"]),
+                "width": float(found["width"]),
+                "height": float(found["height"]),
+            }
+            print(
+                "  [hold] frame=({:.0f},{:.0f} {:.0f}x{:.0f}) elem=({:.0f},{:.0f} {:.0f}x{:.0f}) "
+                "page=({:.0f},{:.0f} {:.0f}x{:.0f}) viewport={} url={}".format(
+                    page_box["x"], page_box["y"], page_box["width"], page_box["height"],
+                    float(found["x"]), float(found["y"]),
+                    float(found["width"]), float(found["height"]),
+                    box["x"], box["y"], box["width"], box["height"],
+                    viewport, (frame.url or "")[:60],
+                )
+            )
+            if _box_in_viewport(box, viewport, min_width=10, min_height=4):
+                return box, True
+            print("  [hold] target outside viewport, rescanning")
+        except Exception:
+            continue
+    return None, False
+
+
+async def _frame_page_box(page, frame):
+    """Return the page-coordinate rectangle of a frame element."""
     try:
-        frames = page.locator('iframe[src*="hsprotect.net"]')
-        for index in range(await frames.count()):
-            box = await frames.nth(index).bounding_box()
-            if _box_in_viewport(box, viewport, min_width=50, min_height=30):
-                return box, False
+        handle = await frame.frame_element()
+        box = await handle.bounding_box()
+        if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+            return box
     except Exception:
         pass
-    return None, False
+    try:
+        return await frame.evaluate(r"""() => {
+            try {
+                const rect = window.frameElement.getBoundingClientRect();
+                return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
+            } catch (e) {
+                return null;
+            }
+        }""")
+    except Exception:
+        return None
 
 
 async def press_and_hold(page, *, label="", press_number=1):
@@ -159,7 +251,14 @@ async def press_and_hold(page, *, label="", press_number=1):
                 pass
             held, passed = 12.0, False
 
-    print(f"{label} held {held:.1f}s{' (passed)' if passed else ''}")
+    try:
+        still_visible = await captcha_visible(page)
+    except Exception:
+        still_visible = None
+    print(
+        f"{label} held {held:.1f}s{' (passed)' if passed else ''}"
+        f" challenge_visible_after={still_visible}"
+    )
     return {
         "held": held,
         "passed": passed,

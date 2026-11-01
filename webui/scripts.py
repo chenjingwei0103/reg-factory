@@ -769,7 +769,7 @@ ENV_SCHEMA = [
          "help": "Outlook Clash 强制排除的节点国家关键词；默认排除香港"},
         {"key": "OUTLOOK_GRAPH_RECOVERY_EMAIL", "type": "bool",
          "default": "true", "help": "启用 Graph proofs/Add 辅助邮箱自动绑定和接码；关闭后无法保证 RT 可提取"},
-        {"key": "OUTLOOK_GRAPH_RECOVERY_PROVIDER", "type": "choice", "choices": ["yyds", "custom", "outlook"],
+        {"key": "OUTLOOK_GRAPH_RECOVERY_PROVIDER", "type": "choice", "choices": ["cfmail", "yyds", "custom", "outlook"],
          "default": "yyds", "help": "Graph 辅助邮箱提供方；outlook 使用下方用户自有邮箱并通过 Graph API 收码"},
         {"key": "OUTLOOK_GRAPH_RECOVERY_OUTLOOK_MAILBOX", "secret": True,
          "help": "provider=outlook 时必填：email@outlook.com----password----refresh_token----client_id。保存前可点本组验证按钮检查 Graph API。"},

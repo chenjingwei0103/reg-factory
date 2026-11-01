@@ -236,6 +236,7 @@ ICLOUD_MAIL_SERVICE = _env("ICLOUD_MAIL_SERVICE", "openai").strip().lower() or "
 CFMAIL_BASE_URL = _env("CFMAIL_BASE_URL", "https://temp-email-api.awsl.uk")
 CFMAIL_ADMIN_PASSWORD = _env("CFMAIL_ADMIN_PASSWORD", "")  # x-admin-auth header
 CFMAIL_SITE_PASSWORD = _env("CFMAIL_SITE_PASSWORD", "")   # x-custom-auth header（可选）
+CFMAIL_DOMAIN = _env("CFMAIL_DOMAIN", "")  # 可选：逗号分隔的可用收件域名白名单
 
 # ---- 自定义临时邮箱（配置驱动，接任意 REST 风格 API，不写代码）----
 # TEMP_EMAIL_PROVIDER=custom 时启用。JSON 路径支持点号+数组下标（如 data.address / data.items[0].id）。

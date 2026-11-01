@@ -22,6 +22,28 @@ from .imaging import (
 from .schema import build_prompt
 
 
+async def human_click_locator(page, locator, timeout=5000):
+    # Scroll into view, hover with CDP mouseMoved (page-level input only, the real OS cursor is not moved), then locator.click().
+    # Returns True when the click was dispatched; raises if the click itself fails so callers can log it.
+    try:
+        await locator.scroll_into_view_if_needed(timeout=timeout)
+    except Exception:
+        pass
+    try:
+        box = await locator.bounding_box()
+        if box and box['width'] > 2 and box['height'] > 2:
+            tx = box['x'] + box['width'] * random.uniform(0.35, 0.65)
+            ty = box['y'] + box['height'] * random.uniform(0.35, 0.65)
+            await page.mouse.move(max(1.0, tx - random.uniform(10, 40)), max(1.0, ty - random.uniform(5, 25)))
+            await asyncio.sleep(random.uniform(0.04, 0.10))
+            await page.mouse.move(tx, ty, steps=random.randint(6, 12))
+            await asyncio.sleep(random.uniform(0.05, 0.15))
+    except Exception:
+        pass
+    await locator.click(timeout=timeout)
+    return True
+
+
 async def _find_frame(page, frame_match):
     """按 url 关键字找承载挑战的 frame；frame_match 空则返回 main_frame。"""
     if not frame_match:

@@ -53,12 +53,13 @@ class CaptchaSpec:
     grid_right_frac: float = 0.164    # 右侧内缩
     grid_pad_frac: float = 0.0        # 兼容旧字段（四周等比内缩，叠加在上面之外），一般留 0
     example_text_sel: str = ""        # 画布外的示例图说明（可空）
+    example_image_sel: str = ""       # 网格上方的示例图元素（可空；空=按位置自动找）
 
     # —— 行为 ——
     answer_format: str = "PICK_LIST"  # PICK_LIST(多选) | ANSWER_INDEX(单选)
     cols: int = 3                     # 拼网格列数 / 网格列数
     max_rounds: int = 6               # 一关最多几轮（reCAPTCHA 选完常出新图）
-    deadline: int = 55                # 单轮投票最多等几秒
+    deadline: int = 120               # 单轮投票最多等几秒（实测网关单次 30-90s，55 会把正确答案丢掉）
     answer_max_tokens: int = 900      # Vision response budget; lower for strict short answers
     settle_ms: int = 800              # 每步操作后等待（页面渲染）
     # 判通过：挑战 frame 消失 / 出现成功标志文本（任一命中即算过）
@@ -99,15 +100,14 @@ SINGLE_PROMPT = (
 
 DRAG_PROMPT = (
     "You are an accessibility helper solving a drag-and-drop visual puzzle. "
-    "The movable piece is usually the full-color character in a card on the right. "
-    "The destination is exactly one dark silhouette among several candidates on the left. "
-    "Compare the complete outer contour carefully, especially the head or snout, tail, "
-    "arms, legs, and pose. Ignore colors, background grid bars, and other silhouettes. "
+    "The image contains movable pattern pieces (often on the left or in cards marked Move) "
+    "and target outline shapes/silhouettes. "
+    "Compare the shape, contours, angles, and orientation carefully to find the piece that fits the matching outline. "
     "Task: \"{instruction}\". "
-    "Give the pixel position to grab (the movable piece's center) and where to drop it (the target's center), "
-    "as fractions 0..1 of the image (x from left edge, y from top edge). "
+    "Give the normalized position to grab (center of the movable piece) and where to drop it (center of the matching target outline), "
+    "as fractions from 0.0 to 1.0 of the image width and height (x from left edge, y from top edge). "
     "Use at most one short sentence of reasoning, then output the VERY LAST line EXACTLY as: FROM=(x,y) TO=(x,y) "
-    "e.g. FROM=(0.20,0.55) TO=(0.78,0.40)."
+    "e.g. FROM=(0.15,0.47) TO=(0.48,0.53)."
 )
 
 

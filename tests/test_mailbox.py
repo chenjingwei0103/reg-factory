@@ -1,4 +1,5 @@
 import unittest
+from tempfile import TemporaryDirectory
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -6,6 +7,72 @@ from common import mailbox
 
 
 class MailboxTests(unittest.TestCase):
+    def test_saved_cfmail_recovery_address_is_restored_with_a_fresh_token(self):
+        address = "recovery@example.test"
+        with TemporaryDirectory() as data_dir:
+            env = {"REG_FACTORY_DATA_DIR": data_dir}
+            mailbox.remember_graph_recovery_mailbox(
+                "owner@outlook.com",
+                {"provider": "cfmail", "email": address, "token": "old-token"},
+                environ=env,
+            )
+            address_response = MagicMock(status_code=200)
+            address_response.json.return_value = {
+                "results": [{"id": 17, "name": address}],
+            }
+            token_response = MagicMock(status_code=200)
+            token_response.json.return_value = {"jwt": "fresh-token"}
+            with patch.object(
+                mailbox.requests,
+                "get",
+                side_effect=(address_response, token_response),
+            ):
+                restored = mailbox.restore_graph_recovery_mailbox(
+                    "owner@outlook.com", environ=env
+                )
+
+        self.assertEqual(restored["provider"], "cfmail")
+        self.assertEqual(restored["email"], address)
+        self.assertEqual(restored["id"], "17")
+        self.assertEqual(restored["token"], "fresh-token")
+
+    def test_masked_cfmail_recovery_address_restores_only_a_unique_match(self):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "results": [
+                {"id": 17, "name": "z2unique@fsdgdfg.samkdiirq.store"},
+                {"id": 18, "name": "other@fsdgdfg.samkdiirq.store"},
+            ],
+        }
+        expected = {"provider": "cfmail", "email": "z2unique@fsdgdfg.samkdiirq.store"}
+        with patch.object(mailbox.requests, "get", return_value=response), patch.object(
+            mailbox, "_restore_cfmail_recovery_mailbox", return_value=expected
+        ) as restore:
+            restored = mailbox.restore_graph_recovery_mailbox_from_mask(
+                "z2*****@fsdgdfg.samkdiirq.store"
+            )
+
+        self.assertEqual(restored, expected)
+        restore.assert_called_once_with("z2unique@fsdgdfg.samkdiirq.store")
+
+    def test_masked_cfmail_recovery_address_rejects_ambiguous_matches(self):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "results": [
+                {"id": 17, "name": "z2first@fsdgdfg.samkdiirq.store"},
+                {"id": 18, "name": "z2second@fsdgdfg.samkdiirq.store"},
+            ],
+        }
+        with patch.object(mailbox.requests, "get", return_value=response), patch.object(
+            mailbox, "_restore_cfmail_recovery_mailbox"
+        ) as restore:
+            restored = mailbox.restore_graph_recovery_mailbox_from_mask(
+                "z2*****@fsdgdfg.samkdiirq.store"
+            )
+
+        self.assertIsNone(restored)
+        restore.assert_not_called()
+
     def test_parse_outlook_recovery_mailbox_record(self):
         result = mailbox.parse_outlook_recovery_mailbox(
             "helper@outlook.com----password----refresh-token----client-id"
@@ -70,6 +137,24 @@ class MailboxTests(unittest.TestCase):
         self.assertEqual(reader.call_args.kwargs["max_wait"], 30)
         self.assertEqual(reader.call_args.kwargs["received_after"], 123.0)
         self.assertIn("microsoft.com", reader.call_args.kwargs["sender_contains"])
+
+    def test_poll_cfmail_recovery_code_forwards_received_after(self):
+        with patch(
+            "common.temp_email.poll_verification_code_blocking",
+            return_value="123456",
+        ) as reader:
+            result = mailbox.poll_graph_recovery_code(
+                {
+                    "provider": "cfmail",
+                    "id": "mailbox-id",
+                    "email": "recovery@example.test",
+                    "token": "address-token",
+                },
+                received_after=123.0,
+            )
+
+        self.assertEqual(result, "123456")
+        self.assertEqual(reader.call_args.kwargs["received_after"], 123.0)
 
     def test_graph_code_reader_excludes_a_previously_rejected_code(self):
         messages = [

@@ -16,7 +16,7 @@ import re
 import string
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 if sys.platform == "win32":
@@ -40,6 +40,50 @@ from common.traffic_saver import (
     log_summary as log_traffic_summary,
     set_bypass as set_traffic_saver_bypass,
 )
+
+
+def install_traffic_recorder(context, path=None):
+    """Best-effort request/response log for one-off debugging."""
+    path = path or os.environ.get("REG_FACTORY_TRAFFIC_LOG")
+    if not path:
+        return None
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        handle = open(path, "a", encoding="utf-8")
+    except Exception as error:
+        print(f"  [traffic-log] open failed: {str(error)[:100]}")
+        return None
+
+    def _on_request(request):
+        try:
+            handle.write(json.dumps({
+                "t": datetime.now(timezone.utc).isoformat(),
+                "type": "request",
+                "method": request.method,
+                "url": request.url,
+            }, ensure_ascii=False) + "\n")
+            handle.flush()
+        except Exception:
+            pass
+
+    def _on_response(response):
+        try:
+            handle.write(json.dumps({
+                "t": datetime.now(timezone.utc).isoformat(),
+                "type": "response",
+                "status": response.status,
+                "url": response.url,
+            }, ensure_ascii=False) + "\n")
+            handle.flush()
+        except Exception:
+            pass
+
+    context.on("request", _on_request)
+    context.on("response", _on_response)
+    print(f"  [traffic-log] recording to {path}")
+    return handle
+
+
 try:
     from check_outlook_status import check_account_api
 except Exception:
@@ -182,9 +226,10 @@ HCAPTCHA_HOOK_JS = r"""
     window.__rfHcaptchaCaptured = window.__rfHcaptchaCaptured || [];
     window.__rfHcaptchaCallbacks = window.__rfHcaptchaCallbacks || [];
     let current = window.hcaptcha;
-    const wrap = (api) => {
-        if (!api || typeof api.render !== 'function' || api.render.__rfWrapped) return api;
-        const original = api.render.bind(api);
+    const watched = new WeakSet();
+    const wrapRender = (api, render) => {
+        if (typeof render !== 'function' || render.__rfWrapped) return render;
+        const original = render.bind(api);
         const wrappedRender = function(container, params) {
             const p = params || {};
             window.__rfHcaptchaCaptured.push({
@@ -203,7 +248,26 @@ HCAPTCHA_HOOK_JS = r"""
             return original(container, params);
         };
         wrappedRender.__rfWrapped = true;
-        api.render = wrappedRender;
+        return wrappedRender;
+    };
+    const watch = (api) => {
+        if (!api || watched.has(api)) return api;
+        watched.add(api);
+        try {
+            let renderFn = wrapRender(api, api.render);
+            Object.defineProperty(api, 'render', {
+                configurable: true,
+                enumerable: true,
+                get() { return renderFn; },
+                set(value) { renderFn = wrapRender(api, value); }
+            });
+        } catch (e) {
+            try {
+                if (typeof api.render === 'function' && !api.render.__rfWrapped) {
+                    api.render = wrapRender(api, api.render);
+                }
+            } catch (e2) {}
+        }
         window.__rfHcaptchaApi = api;
         return api;
     };
@@ -211,12 +275,12 @@ HCAPTCHA_HOOK_JS = r"""
         Object.defineProperty(window, 'hcaptcha', {
             configurable: true,
             get() { return current; },
-            set(value) { current = wrap(value); }
+            set(value) { current = watch(value); }
         });
     } catch (e) {}
-    // hCaptcha first assigns an incomplete window.hcaptcha object, then invokes
-    // its named onload callback as soon as render() is attached. Wrap at that
-    // boundary so Claude's immediate Promise microtask cannot beat our poller.
+    // hCaptcha assigns an incomplete object first, then attaches render() and
+    // immediately calls onload. Watch that property once. A 20ms poll kept
+    // rewriting render and made the live challenge iframe flicker.
     const originalAppendChild = Element.prototype.appendChild;
     Element.prototype.appendChild = function(node) {
         try {
@@ -225,7 +289,7 @@ HCAPTCHA_HOOK_JS = r"""
                 const ready = readyName && window[readyName];
                 if (typeof ready === 'function' && !ready.__rfWrapped) {
                     const wrappedReady = function(...args) {
-                        try { current = wrap(window.hcaptcha); } catch (e) {}
+                        try { current = watch(window.hcaptcha); } catch (e) {}
                         return ready.apply(this, args);
                     };
                     wrappedReady.__rfWrapped = true;
@@ -235,10 +299,7 @@ HCAPTCHA_HOOK_JS = r"""
         } catch (e) {}
         return originalAppendChild.call(this, node);
     };
-    window.setInterval(() => {
-        try { if (window.hcaptcha) current = wrap(window.hcaptcha); } catch (e) {}
-    }, 20);
-    if (current) current = wrap(current);
+    if (current) current = watch(current);
 })();
 """
 
@@ -3887,108 +3948,36 @@ def _select_claude_vision_voter():
     return None
 
 
-async def _visible_claude_hcaptcha_frame(page, timeout=15):
-    """Wait for the native challenge canvas, ignoring hidden preload frames."""
-    deadline = time.monotonic() + max(0, timeout)
-    checkbox_clicked = False
-    challenge_debug = []
-    while time.monotonic() < deadline:
-        for frame in page.frames:
-            url = (frame.url or "").lower()
-            if "hcaptcha" not in url and "frame=challenge" not in url:
-                continue
-            try:
-                owner = await frame.frame_element()
-                owner_box = await owner.bounding_box()
-            except Exception:
-                owner_box = None
-            if "frame=challenge" in url and owner_box:
-                try:
-                    canvas = frame.locator("canvas").first
-                    canvas_box = await canvas.bounding_box() if await canvas.count() else None
-                except Exception:
-                    canvas_box = None
-                if (owner_box.get("width", 0) > 100
-                        and owner_box.get("height", 0) > 100
-                        and canvas_box and canvas_box.get("width", 0) > 100):
-                    return frame
-            if "frame=challenge" in url:
-                try:
-                    canvas_state = await frame.evaluate("""() => {
-                        const canvas = document.querySelector('canvas');
-                        return {
-                            ready: document.readyState,
-                            canvases: document.querySelectorAll('canvas').length,
-                            width: canvas?.width || 0,
-                            height: canvas?.height || 0,
-                            tasks: document.querySelectorAll('.task-image').length,
-                            submit: document.querySelectorAll('.button-submit').length,
-                            text: (document.body?.innerText || '').trim().slice(0, 80)
-                        };
-                    }""")
-                except Exception:
-                    canvas_state = {}
-                challenge_debug = [
-                    f"ready={canvas_state.get('ready', '?')}",
-                    f"canvases={canvas_state.get('canvases', 0)}",
-                    f"buffer={canvas_state.get('width', 0)}x{canvas_state.get('height', 0)}",
-                    f"tasks={canvas_state.get('tasks', 0)}",
-                    f"submit={canvas_state.get('submit', 0)}",
-                    f"owner={'visible' if owner_box else 'hidden'}",
-                    f"text={str(canvas_state.get('text', ''))[:40]!r}",
-                ]
-                if (owner_box and owner_box.get("width", 0) > 100
-                        and canvas_state.get("tasks", 0) >= 3):
-                    print("  [vision] visible DOM-tile hCaptcha challenge detected")
-                    return frame
-                if (canvas_state.get("width", 0) > 100
-                        and canvas_state.get("height", 0) > 100):
-                    try:
-                        owner = await frame.frame_element()
-                        await owner.evaluate("""iframe => {
-                            iframe.style.setProperty('display', 'block', 'important');
-                            iframe.style.setProperty('visibility', 'visible', 'important');
-                            iframe.style.setProperty('opacity', '1', 'important');
-                            iframe.style.setProperty('position', 'fixed', 'important');
-                            iframe.style.setProperty('left', 'calc(50% - 250px)', 'important');
-                            iframe.style.setProperty('top', '12px', 'important');
-                            iframe.style.setProperty('width', '500px', 'important');
-                            iframe.style.setProperty('height', '600px', 'important');
-                            iframe.style.setProperty('z-index', '2147483647', 'important');
-                            iframe.style.setProperty('pointer-events', 'auto', 'important');
-                        }""")
-                        await asyncio.sleep(0.5)
-                        canvas = frame.locator("canvas").first
-                        canvas_box = await canvas.bounding_box()
-                        if canvas_box and canvas_box.get("width", 0) > 100:
-                            print("  [vision] revealed a rendered hidden hCaptcha challenge")
-                            return frame
-                    except Exception:
-                        pass
-            if not checkbox_clicked and "frame=checkbox" in url:
-                try:
-                    checkbox = frame.locator('#checkbox, [role="checkbox"]').first
-                    if await checkbox.count() and await checkbox.is_visible():
-                        await checkbox.click(timeout=3000, force=True)
-                        checkbox_clicked = True
-                        print("  [vision] triggered the hCaptcha checkbox")
-                except Exception:
-                    try:
-                        checkbox_clicked = bool(await frame.evaluate("""() => {
-                            const target = document.querySelector('#checkbox, [role="checkbox"]');
-                            if (!target) return false;
-                            target.click();
-                            return true;
-                        }"""))
-                        if checkbox_clicked:
-                            print("  [vision] triggered the invisible hCaptcha widget")
-                    except Exception:
-                        pass
-        await asyncio.sleep(0.5)
-    if challenge_debug:
-        print(f"  [vision] hCaptcha challenge state: {' '.join(challenge_debug)}")
-    return None
+async def _visible_claude_hcaptcha_frame(page):
+    """Return the challenge frame only when its canvas/DOM tiles are user-visible.
 
+    Risk control: never touch hidden preload frames. A single-shot visibility
+    scan replaces the old 0.5s polling loop that probed hCaptcha internals
+    and got flagged during manual verification.
+    """
+    for frame in page.frames:
+        url = (frame.url or "").lower()
+        if "frame=challenge" not in url:
+            continue
+        try:
+            owner = await frame.frame_element()
+            owner_box = await owner.bounding_box()
+            if not owner_box or owner_box.get("width", 0) <= 100 or owner_box.get("height", 0) <= 100:
+                continue
+            canvas = frame.locator("canvas").first
+            canvas_box = await canvas.bounding_box() if await canvas.count() else None
+        except Exception:
+            continue
+        if canvas_box and canvas_box.get("width", 0) > 100:
+            return frame
+        try:
+            tile_count = await frame.locator(".task-image").count()
+        except Exception:
+            tile_count = 0
+        if tile_count >= 3:
+            print("  [vision] visible DOM-tile hCaptcha challenge detected")
+            return frame
+    return None
 
 async def dismiss_claude_cookie_banner(page):
     """Dismiss Claude's cookie banner, preferring non-essential rejection."""
@@ -4022,16 +4011,14 @@ async def dismiss_claude_cookie_banner(page):
 
 async def _solve_claude_hcaptcha_vision(page):
     """Solve Claude hCaptcha through its native UI and agent-captcha backend."""
-    await dismiss_claude_cookie_banner(page)
-    challenge_frame = await _visible_claude_hcaptcha_frame(page)
+    if os.environ.get("REG_FACTORY_CLAUDE_SKIP_COOKIE_DISMISS", "0") == "0":
+        await dismiss_claude_cookie_banner(page)
+    if os.environ.get("REG_FACTORY_CLAUDE_SKIP_FRAME_POLL", "0") == "0":
+        challenge_frame = await _visible_claude_hcaptcha_frame(page)
+    else:
+        challenge_frame = None
     if challenge_frame is None:
         print("  [vision] hCaptcha frame is present but its challenge canvas is not visible")
-        try:
-            await page.screenshot(
-                path="screenshots/claude_hcaptcha_no_visual.png", full_page=True
-            )
-        except Exception:
-            pass
         return None
     voter = await asyncio.to_thread(_select_claude_vision_voter)
     if not voter:
@@ -4168,6 +4155,21 @@ async def _read_claude_hcaptcha_instruction(challenge_frame, timeout=8):
     return ""
 
 
+async def _pause_claude_page_for_manual_test(page, message):
+    """Keep the live browser open without further automation."""
+    print(message)
+    while True:
+        try:
+            if page.is_closed():
+                print("  [hcaptcha] manual test page closed")
+                raise ClaudeChallengeError("manual test page closed")
+        except ClaudeChallengeError:
+            raise
+        except Exception:
+            raise ClaudeChallengeError("manual test page closed")
+        await asyncio.sleep(2)
+
+
 async def solve_claude_hcaptcha(page, manual_timeout=None):
     if not await _claude_hcaptcha_present(page):
         return True
@@ -4179,8 +4181,13 @@ async def solve_claude_hcaptcha(page, manual_timeout=None):
     ]
     if frame_urls:
         print(f"  [hcaptcha] frames: {' | '.join(frame_urls)}")
-    os.makedirs("screenshots", exist_ok=True)
-    await page.screenshot(path="screenshots/claude_hcaptcha_detected.png", full_page=True)
+    # os.makedirs("screenshots", exist_ok=True)
+    # await page.screenshot(path="screenshots/claude_hcaptcha_detected.png", full_page=True)
+    if os.environ.get("REG_FACTORY_CLAUDE_PAUSE_AT_HCAPTCHA", "0") != "0":
+        await _pause_claude_page_for_manual_test(
+            page,
+            "  [hcaptcha] paused for manual test after frame detection",
+        )
 
     try:
         vision_result = await _solve_claude_hcaptcha_vision(page)
@@ -4193,12 +4200,24 @@ async def solve_claude_hcaptcha(page, manual_timeout=None):
             return True
         raise
     if vision_result:
+        if os.environ.get("REG_FACTORY_CLAUDE_PAUSE_AFTER_HCAPTCHA", "1") != "0":
+            await _pause_claude_page_for_manual_test(
+                page,
+                "  [hcaptcha] paused for manual test after visual solve",
+            )
         return True
     if vision_result is None:
         # hCaptcha keeps hidden preload frames around. Let the magic-link state
         # loop wait for either a real challenge canvas or an authenticated route.
         return None
     print("  [hcaptcha] agent_captcha visual solve unavailable")
+
+    if os.environ.get("REG_FACTORY_CLAUDE_PAUSE_AFTER_HCAPTCHA", "1") != "0":
+        await _pause_claude_page_for_manual_test(
+            page,
+            "  [hcaptcha] paused for manual test after manual solve",
+        )
+        return True
 
     timeout = CLAUDE_CAPTCHA_MANUAL_TIMEOUT if manual_timeout is None else manual_timeout
     if timeout > 0:
@@ -4344,6 +4363,215 @@ async def _install_claude_hcaptcha_hook(page):
     print("  hCaptcha hook armed for magic-link page")
 
 
+def _pick_verification_code(singles, preview):
+    """Choose the email-link page's login code, not an incidental year."""
+    rejected = {"2024", "2025", "2026", "2027", "2028"}
+    ordered = []
+    for value in singles or []:
+        digits = "".join(ch for ch in str(value) if ch.isdigit())
+        if digits and digits not in rejected and digits not in ordered:
+            ordered.append(digits)
+    for length in (6, 8, 4, 5, 7):
+        for digits in ordered:
+            if len(digits) == length:
+                return digits
+    text = " ".join(str(preview or "").split())
+    labeled = re.search(
+        r"(?:verification code|login code|your code|code|验证码|コード)"
+        r"[^\d]{0,24}(\d{4,8})",
+        text,
+        re.IGNORECASE,
+    )
+    if labeled and labeled.group(1) not in rejected:
+        return labeled.group(1)
+    loose = re.findall(r"(?<!\d)(\d{6})(?!\d)", text)
+    for digits in reversed(loose):
+        if digits not in rejected:
+            return digits
+    return ""
+
+
+async def read_claude_verification_code(context, link, timeout=30):
+    """Open the email address in a separate tab and read the displayed code."""
+    tab = await context.new_page()
+    try:
+        print("  [code] opening the email link in a new tab")
+        await tab.goto(link, timeout=30000, wait_until="domcontentloaded")
+        deadline = time.monotonic() + timeout
+        last_preview = ""
+        while time.monotonic() < deadline:
+            try:
+                found = await tab.evaluate("""() => {
+                    const text = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
+                    const singles = [];
+                    for (const el of document.querySelectorAll('body *')) {
+                        if (el.children.length) continue;
+                        const value = (el.textContent || '').trim();
+                        if (/^\\d{4,8}$/.test(value)) singles.push(value);
+                    }
+                    return {singles, preview: text.slice(0, 240)};
+                }""")
+            except Exception as error:
+                print(f"  [code] email tab not readable yet: {str(error)[:80]}")
+                await asyncio.sleep(1)
+                continue
+            last_preview = " ".join(str(found.get("preview") or "").split())
+            code = _pick_verification_code(found.get("singles"), last_preview)
+            if code:
+                print(f"  [code] verification code read: {code}")
+                if last_preview:
+                    print(f"  [code] email page preview: {last_preview[:140]}")
+                return code
+            await asyncio.sleep(1)
+        if last_preview:
+            print(f"  [code] no code on email page: {last_preview[:140]}")
+        else:
+            print("  [code] no verification code on the email link page")
+        return ""
+    finally:
+        try:
+            await tab.close()
+        except Exception:
+            pass
+
+
+async def _click_claude_code_continue(page):
+    labels = (
+        "Continue", "Verify", "Submit", "Next",
+        "继续", "验证", "下一步", "確認", "続行",
+    )
+    for label in labels:
+        try:
+            buttons = page.get_by_role("button", name=label, exact=True)
+            count = await buttons.count()
+        except Exception:
+            count = 0
+        for index in range(count):
+            button = buttons.nth(index)
+            try:
+                if await button.is_visible():
+                    await button.click(timeout=4000)
+                    return label
+            except Exception:
+                continue
+    return ""
+
+
+async def submit_claude_email_code(page, code):
+    """Type the email code into the Claude page that requested it."""
+    print("  [code] entering verification code on the original Claude page")
+    deadline = time.monotonic() + 25
+    target = None
+    while time.monotonic() < deadline:
+        try:
+            target = await page.evaluate("""() => {
+                const visible = (el) => {
+                    const style = getComputedStyle(el);
+                    const box = el.getBoundingClientRect();
+                    return style.visibility !== 'hidden' && style.display !== 'none'
+                        && box.width > 0 && box.height > 0;
+                };
+                const inputs = [...document.querySelectorAll('input')].filter((el) => (
+                    visible(el)
+                    && !['hidden', 'email', 'password', 'checkbox', 'radio'].includes(el.type)
+                ));
+                const boxes = inputs.filter((el) => el.maxLength === 1);
+                const described = inputs.map((el) => (
+                    (el.name || '') + ' ' + (el.id || '') + ' '
+                    + (el.autocomplete || '') + ' ' + (el.placeholder || '') + ' '
+                    + (el.getAttribute('aria-label') || '')
+                ).toLowerCase());
+                const codeIndex = described.findIndex((text) => /code|otp|pin|验证码|コード/.test(text));
+                const numericIndex = inputs.findIndex((el) => (
+                    el.inputMode === 'numeric' || el.type === 'tel' || el.type === 'text'
+                ));
+                return {
+                    boxCount: boxes.length,
+                    codeIndex,
+                    numericIndex,
+                    inputCount: inputs.length,
+                };
+            }""")
+        except Exception:
+            target = None
+        if target and (
+            target.get("boxCount", 0) >= len(code)
+            or target.get("codeIndex", -1) >= 0
+            or target.get("numericIndex", -1) >= 0
+        ):
+            break
+        target = None
+        await asyncio.sleep(0.5)
+    if not target:
+        preview = ""
+        try:
+            preview = " ".join((await page.locator("body").inner_text(timeout=2000)).split())
+        except Exception:
+            pass
+        if preview:
+            print(f"  [code] Claude page has no code field: {preview[:140]}")
+        raise ClaudeChallengeError("Claude login page has no verification code field")
+    if target.get("boxCount", 0) >= len(code):
+        boxes = page.locator('input[maxlength="1"]')
+        count = await boxes.count()
+        for index, char in enumerate(code):
+            if index >= count:
+                break
+            box = boxes.nth(index)
+            await box.click(timeout=4000)
+            await box.fill(char)
+            await asyncio.sleep(0.05)
+    else:
+        index = target.get("codeIndex", -1)
+        if index < 0:
+            index = target.get("numericIndex", 0)
+        field = page.locator(
+            'input:not([type="hidden"]):not([type="email"]):not([type="password"])'
+        ).nth(index)
+        await field.click(timeout=4000)
+        await field.fill("")
+        await page.keyboard.type(code, delay=60)
+    print("  [code] code entered")
+    clicked = await _click_claude_code_continue(page)
+    if clicked:
+        print(f"  [code] submitted with {clicked}")
+    else:
+        await page.keyboard.press("Enter")
+        print("  [code] submitted with Enter")
+    await asyncio.sleep(1)
+
+
+async def continue_claude_after_email_code(page, timeout=180):
+    """The visual challenge belongs to the original page after the code is sent."""
+    print("  [code] waiting for the visual challenge on the Claude page")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        path = (page.url or "").split("#", 1)[0]
+        if any(route in path for route in ("/chat", "/new", "/onboarding", "/settings")):
+            print(f"  [code] Claude continued to {path}")
+            return True
+        if await _claude_hcaptcha_present(page):
+            print("  [code] visual challenge appeared after the email code")
+            solved = await solve_claude_hcaptcha(page)
+            if not solved:
+                raise ClaudeChallengeError("Claude hCaptcha was not solved")
+            await asyncio.sleep(2)
+            print(f"  [code] visual challenge finished at {page.url}")
+            return True
+        await asyncio.sleep(1)
+    raise ClaudeChallengeError("Claude email code did not reach the visual challenge")
+
+
+async def complete_claude_email_code_on_login_page(context, page, magic_link):
+    code = await read_claude_verification_code(context, magic_link)
+    if not code:
+        raise ClaudeChallengeError("Claude email link did not show a verification code")
+    await submit_claude_email_code(page, code)
+    print(f"  URL: {page.url}")
+    await continue_claude_after_email_code(page)
+    return True
+
+
 async def open_claude_magic_link(page, magic_link):
     """Arm hCaptcha capture before loading the magic-link document."""
     await _install_claude_hcaptcha_hook(page)
@@ -4388,11 +4616,18 @@ def _native_claude_magic_verify_succeeded(page):
     status = getattr(page, "_rf_magic_verify_status", None)
     body = str(getattr(page, "_rf_magic_verify_response_body", "") or "")
     compact_body = "".join(body.lower().split())
-    return (
+    if not (
         isinstance(status, int)
         and 200 <= status < 300
         and '"success":true' in compact_body
-    )
+    ):
+        return False
+    if "completed_verifications" in compact_body:
+        return True
+    if '"memberships":[]' in compact_body or '"is_verified":false' in compact_body:
+        print("  [magic-browser] verify returned unusable account state; treated as failed")
+        return False
+    return True
 
 
 async def _finish_native_claude_magic_verify(page):
@@ -4428,8 +4663,28 @@ async def prepare_claude_post_magic(page, max_wait=25):
             if await _finish_native_claude_magic_verify(page):
                 return True
             if solved is None:
-                await asyncio.sleep(1)
-                continue
+                # Challenge canvas not user-visible -- wait passively without
+                # re-probing the frame. Manual solve or native verify completes
+                # asynchronously; check for verify interception / URL change.
+                print("  [hcaptcha] challenge not user-visible, waiting for manual solve or native verify")
+                for _wait_tick in range(150):
+                    if await _finish_native_claude_magic_verify(page):
+                        return True
+                    native_status = getattr(page, "_rf_magic_verify_status", None)
+                    if native_status == 403:
+                        raise ClaudeChallengeError(
+                            "Claude native magic-link verification rejected HTTP 403"
+                        )
+                    path = page.url.split("#", 1)[0]
+                    if any(r in path for r in ("/chat", "/new", "/onboarding", "/settings")):
+                        return True
+                    # Do NOT re-check hCaptcha presence -- the challenge iframe
+                    # contains form elements that would be misdetected as a
+                    # visible form. Only verify hook / URL change can unblock.
+                    await asyncio.sleep(2)
+                raise ClaudeChallengeError(
+                    "hCaptcha challenge remained unsolved after waiting"
+                )
             if not solved:
                 raise ClaudeChallengeError("Claude hCaptcha was not solved")
             # Captcha solving may itself run past max_wait. Check the native
@@ -4508,10 +4763,6 @@ async def prepare_claude_post_magic_with_http_fallback(page, magic_link, max_wai
         )
         if not any(marker in str(error) for marker in recoverable):
             raise
-        print(
-            "  [magic-http] browser magic-link verification incomplete; "
-            "trying token verification in the pending browser session"
-        )
         if await verify_claude_magic_link_with_browser_token(page, magic_link):
             return True
         if getattr(page, "__dict__", {}).get("_rf_visible_email_submitted"):
@@ -4597,6 +4848,44 @@ async def handle_birthday_page(page, birth_year, birth_month, birth_day):
             f"{birth_month:02d}/{birth_day:02d}/{birth_year}"
         )
         return True
+
+    # Claude renders mm/dd/yyyy as three React Aria spinbuttons, not an input.
+    segment_values = (
+        ("month", f"{int(birth_month):02d}", int(birth_month)),
+        ("day", f"{int(birth_day):02d}", int(birth_day)),
+        ("year", f"{int(birth_year):04d}", int(birth_year)),
+    )
+    filled_segments = 0
+    for label, typed, expected in segment_values:
+        locator = page.locator(f'[role="spinbutton"][aria-label^="{label}" i]').first
+        try:
+            if not await locator.count() or not await locator.is_visible():
+                continue
+            await locator.click(timeout=3000)
+            await asyncio.sleep(0.1)
+            await page.keyboard.type(typed, delay=70)
+            await asyncio.sleep(0.15)
+            actual = await locator.get_attribute("aria-valuenow")
+            if str(actual or "").strip() == str(expected):
+                filled_segments += 1
+            else:
+                print(f"    {label} segment kept {actual!r}, expected {expected}")
+        except Exception as error:
+            print(f"    fill {label} segment failed: {str(error)[:80]}")
+    if filled_segments == len(segment_values):
+        expected_iso = f"{int(birth_year):04d}-{int(birth_month):02d}-{int(birth_day):02d}"
+        hidden_value = ""
+        hidden = page.locator('[data-cds="DateInput"] input[type="hidden"]').first
+        try:
+            if await hidden.count():
+                hidden_value = (await hidden.input_value()).strip()
+        except Exception:
+            hidden_value = ""
+        if hidden_value and hidden_value != expected_iso:
+            print(f"  [birthday] segment mismatch hidden={hidden_value} expected={expected_iso}")
+        else:
+            print(f"  [birthday] date segments: {expected_iso}")
+            return True
 
     # method 1: standard <select>
     selects = page.locator('select')
@@ -4814,89 +5103,74 @@ def _log_claude_account_onboarding_state(state):
 
 async def _accept_claude_terms(page):
     """Accept required terms and submit without opting into marketing."""
-    checkboxes = page.locator(
-        '[data-test-id="terms-acceptance"], '
-        'input[type="checkbox"][required], '
-        '[role="checkbox"][aria-required="true"]'
-    )
-    required = []
-    for index in range(await checkboxes.count()):
-        checkbox = checkboxes.nth(index)
-        required.append(checkbox)
-    if not required:
-        print("  [onboarding] required terms checkbox was not found")
-        return False
-
-    for checkbox in required:
-        try:
-            checked = await checkbox.is_checked(timeout=1500)
-        except Exception:
-            try:
-                checked = await checkbox.evaluate("""element => (
-                    element.checked === true
-                    || element.getAttribute('aria-checked') === 'true'
-                    || element.getAttribute('data-state') === 'checked'
-                )""")
-            except Exception:
-                checked = False
-        if not checked:
-            try:
-                checked = await checkbox.evaluate("""element => {
-                    if (!element.checked) element.click();
-                    return element.checked === true;
-                }""")
-            except Exception:
-                checked = False
-            if not checked:
-                print("  [onboarding] could not activate required terms checkbox")
-                return False
-
-    await asyncio.sleep(1)
-    for checkbox in required:
-        try:
-            checked = await checkbox.is_checked(timeout=1500)
-        except Exception:
-            try:
-                checked = await checkbox.evaluate("""element => (
-                    element.checked === true
-                    || element.getAttribute('aria-checked') === 'true'
-                    || element.getAttribute('data-state') === 'checked'
-                )""")
-            except Exception:
-                # The terms control is removed as soon as Claude advances.
-                if await page.locator(
-                    '[data-test-id="terms-acceptance"]'
-                ).count() == 0:
-                    continue
-                checked = False
-        if not checked:
-            print("  [onboarding] terms checkbox did not stay checked")
-            return False
-    print(f"  [onboarding] confirmed {len(required)} required terms checkbox(es)")
-    try:
-        submitted = await page.evaluate("""() => {
-            const required = document.querySelector(
+    selected = await page.evaluate(r"""() => {
+        const norm = value => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const isChecked = element => (
+            element.checked === true
+            || element.getAttribute('aria-checked') === 'true'
+            || element.getAttribute('data-state') === 'checked'
+        );
+        const isTerms = text => (
+            (text.includes('consumer terms') || text.includes('acceptable use')
+                || text.includes('conditions d') || text.includes('条款'))
+            && !text.includes('promotional')
+            && !text.includes('marketing')
+            && !text.includes('promotionnel')
+        );
+        const controls = [...document.querySelectorAll(
+            '[data-test-id="terms-acceptance"], input[type="checkbox"], [role="checkbox"]'
+        )];
+        const groups = new Map();
+        for (const element of controls) {
+            const explicit = element.matches(
                 '[data-test-id="terms-acceptance"], input[type="checkbox"][required], [role="checkbox"][aria-required="true"]'
             );
-            const form = required?.closest('form');
-            const submit = form?.querySelector('button[type="submit"], input[type="submit"]')
-                || document.querySelector('button[type="submit"], input[type="submit"]');
-            if (!submit) return false;
-            submit.click();
-            return true;
-        }""")
-    except Exception:
-        submitted = False
-    if not submitted:
-        state = await _claude_account_onboarding_state(page)
-        if not state.get("accepted_clickwrap_versions"):
-            print("  [onboarding] required terms submit control was not found")
-            return False
-        print("  [onboarding] required terms persisted during UI transition")
-        return True
+            let node = element;
+            let matched = explicit ? element : null;
+            for (let depth = 0; !matched && node && depth < 6; depth += 1, node = node.parentElement) {
+                const text = norm(node.innerText);
+                if (!text) continue;
+                if (text.length > 500 || text.includes('promotional') || text.includes('promotionnel')) break;
+                if (explicit || isTerms(text)) {
+                    matched = node;
+                    break;
+                }
+            }
+            if (!matched) continue;
+            const items = groups.get(matched) || [];
+            items.push(element);
+            groups.set(matched, items);
+        }
+        const chosen = [...groups.values()].map(items => (
+            items.find(element => element.matches('input[type="checkbox"]')) || items[0]
+        ));
+        let checked = 0;
+        for (const element of chosen) {
+            if (!isChecked(element)) element.click();
+            if (!isChecked(element)) {
+                const visual = element.parentElement?.querySelector('[role="checkbox"]');
+                if (visual && visual !== element) visual.click();
+            }
+            if (isChecked(element) || isChecked(element.parentElement?.querySelector('[role="checkbox"]') || element)) {
+                checked += 1;
+            }
+        }
+        const submit = chosen.length
+            ? (chosen[0].closest('form')?.querySelector('button[type="submit"], input[type="submit"]')
+                || document.querySelector('button[type="submit"], input[type="submit"]'))
+            : null;
+        if (submit) submit.click();
+        return {found: chosen.length, checked, submitted: Boolean(submit)};
+    }""")
+    if not isinstance(selected, dict) or not selected.get('found') or not selected.get('checked'):
+        print("  [onboarding] required terms checkbox was not found")
+        return False
+    print(f"  [onboarding] confirmed {int(selected.get('checked') or 0)} required terms checkbox(es)")
+    if not selected.get('submitted'):
+        print("  [onboarding] required terms submit control was not found")
+        return False
     print("  [onboarding] submitted required terms form")
     return True
-
 
 async def handle_onboarding(page, first_name, last_name, max_rounds=16):
     """Click through post-registration onboarding pages:
@@ -5049,6 +5323,27 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=16):
                 await asyncio.sleep(2)
                 continue
             await asyncio.sleep(6)
+            continue
+
+        if not clicked and any(k in page_lower for k in (
+            'birthday', 'date of birth', 'birth date', 'date de naissance',
+        )):
+            birth_year, birth_month, birth_day = generate_birthday()
+            print(
+                "  [onboarding] birthday page, filling "
+                f"{birth_year}-{birth_month:02d}-{birth_day:02d}"
+            )
+            if await handle_birthday_page(page, birth_year, birth_month, birth_day):
+                submit_btn = page.locator(
+                    'button:has-text("Continue"), button:has-text("Next"), '
+                    'button[type="submit"]'
+                ).first
+                try:
+                    await submit_btn.click(timeout=8000)
+                    print("  [onboarding] birthday submitted")
+                except Exception as error:
+                    print(f"  [onboarding] birthday submit failed: {str(error)[:80]}")
+            await asyncio.sleep(2)
             continue
 
         # "Personal" use button / card
@@ -5904,6 +6199,7 @@ async def register(
             browser = await p.chromium.connect_over_cdp(ws_url)
             context = browser.contexts[0]
             await install_traffic_saver(context)
+            install_traffic_recorder(context)
             if str(auth_mode or "magic").strip().lower() == "google":
                 # Google Identity Services must load before the OAuth button is
                 # clicked; enabling bypass only inside the click handler is too
@@ -6255,6 +6551,9 @@ async def register(
                 has_browser_login_state = bool(
                     getattr(page, "_rf_visible_email_submitted", False)
                 )
+                # A Claude magic link stays on Loading until the visual
+                # challenge renders. Opening it in a disposable tab only looks
+                # for a numeric code and discards that challenge.
                 verified_over_http = False
                 if not has_browser_login_state:
                     verified_over_http = await verify_claude_magic_link_http(
@@ -6263,7 +6562,6 @@ async def register(
                 if not verified_over_http:
                     await open_claude_magic_link(page, magic_link)
                 print(f"  URL: {page.url}")
-
                 check_timeout()
                 await prepare_claude_post_magic_with_http_fallback(page, magic_link)
                 check_timeout()
@@ -6368,8 +6666,30 @@ async def register(
                 else:
                     print(f"  [{desc}] unknown field, skipping")
 
-            # checkboxes
-            cb_clicked = await page.evaluate("""
+            try:
+                form_text = (await page.evaluate("() => document.body.innerText") or "").lower()
+            except Exception:
+                form_text = ""
+            terms_page = (
+                "let's create your account" in form_text
+                or "consumer terms" in form_text
+            )
+            marketing_login = "/login" in page.url.lower() and any(
+                marker in form_text for marker in (
+                    "continue with", "continuer avec", "saisissez votre e-mail",
+                    "interrogez",
+                )
+            )
+            if terms_page:
+                if await _accept_claude_terms(page):
+                    print("  accepted account terms")
+                else:
+                    print("  account terms page was not submitted")
+            elif marketing_login:
+                print("  login page is not the account form; not submitting it")
+            else:
+                # checkboxes
+                cb_clicked = await page.evaluate("""
                 () => {
                     let clicked = 0;
                     document.querySelectorAll('input[type="checkbox"]').forEach(el => {
@@ -6384,21 +6704,22 @@ async def register(
                     return clicked;
                 }
             """)
-            if cb_clicked > 0:
-                print(f"  checked {cb_clicked} checkboxes")
+                if cb_clicked > 0:
+                    print(f"  checked {cb_clicked} checkboxes")
 
-            # submit（magic-link 有时直接落 /new 已登录态、无注册表单/提交按钮 —— 容错跳过，
-            # 别用默认 30s 阻塞 click 崩掉，否则已登录的号反而存不到 cookie）
-            submit_btn = page.locator(
-                'button:has-text("Create"), button:has-text("Continue"), '
-                'button:has-text("Submit"), button:has-text("Next"), button[type="submit"]'
-            ).first
-            try:
-                await submit_btn.click(timeout=8000)
-                print("  submitted")
-            except Exception:
-                print(f"  no submit button (likely already logged in at {page.url}), skip form submit")
-            await asyncio.sleep(3)
+            if not terms_page and not marketing_login:
+                # submit（magic-link 有时直接落 /new 已登录态、无注册表单/提交按钮 —— 容错跳过，
+                # 别用默认 30s 阻塞 click 崩掉，否则已登录的号反而存不到 cookie）
+                submit_btn = page.locator(
+                    'button:has-text("Create"), button:has-text("Continue"), '
+                    'button:has-text("Submit"), button:has-text("Next"), button[type="submit"]'
+                ).first
+                try:
+                    await submit_btn.click(timeout=8000)
+                    print("  submitted")
+                except Exception:
+                    print(f"  no submit button (likely already logged in at {page.url}), skip form submit")
+                await asyncio.sleep(3)
             print(f"  URL: {page.url}")
             check_timeout()
 
@@ -6425,13 +6746,22 @@ async def register(
             await asyncio.sleep(3)
             page_text = await page.evaluate("() => document.body.innerText.toLowerCase()")
             current_url = page.url
+            is_birthday_prompt = any(
+                marker in page_text
+                for marker in (
+                    'birthday', 'date of birth', 'birth date', 'date de naissance',
+                )
+            )
             needs_phone = (
-                'phone' in page_text
-                or 'verify' in page_text
-                or 'verification' in page_text
-                or 'sms' in page_text
-                or 'enter your phone' in page_text
-                or await page.locator('input[type="tel"]').count() > 0
+                not is_birthday_prompt
+                and (
+                    'phone' in page_text
+                    or 'verify' in page_text
+                    or 'verification' in page_text
+                    or 'sms' in page_text
+                    or 'enter your phone' in page_text
+                    or await page.locator('input[type="tel"]').count() > 0
+                )
             )
             cookies = await context.cookies()
             has_session_key = any(
@@ -6451,6 +6781,17 @@ async def register(
                 raise ClaudeChallengeError(
                     "Claude magic-link flow did not create an authenticated session"
                 )
+            if has_session_key and "/login" in current_url and "/onboarding" not in current_url:
+                print("  session cookie is present but login page is still open; opening onboarding")
+                try:
+                    await page.goto(
+                        "https://claude.ai/onboarding",
+                        timeout=60000,
+                        wait_until="domcontentloaded",
+                    )
+                except Exception as error:
+                    print(f"  onboarding navigation warning: {str(error)[:120]}")
+                await asyncio.sleep(2)
             if not needs_phone:
                 print("\n  no phone needed, skipping to onboarding!")
             elif is_logged_in:

@@ -835,18 +835,15 @@ def _write_env_file(path, updates):
                 seen.add(k)
                 continue
         out.append(line)
-    # 新增的 key
     extra = [k for k in updates if k not in seen]
     if extra:
         out.append("")
         out.append("# ---- 由 WebUI 配置页新增 ----")
         for k in extra:
             out.append(f"{k}={updates[k]}")
-    # 原子写
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write("\n".join(out) + "\n")
-    os.replace(tmp, path)
+    content = "\n".join(out) + "\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
 
 
 def _apply_saved_env(updates):
@@ -3570,9 +3567,11 @@ async def api_authorize_outlook(request: Request):
 
         await asyncio.to_thread(proxy_switch.ensure_proxy_mode, task_env)
         command = _build_cmd(script, args)
-        # ``--method`` is selected by the dedicated Graph authorization UI
-        # control and is intentionally kept out of the general task schema.
+        # ``--method`` and ``--dedicated-proxy`` are selected by the Graph
+        # authorization controls and are intentionally kept out of the schema.
         command.extend(["--method", method])
+        if dedicated_proxy:
+            command.append("--dedicated-proxy")
         started = await _start_managed_run(command, "unlock_outlook", task_env, runtime_root)
         RUNS[started["run_id"]]["sensitive_input_path"] = input_path
         return {**started, "accepted": len(records), "accepted_emails": [email for email, _password in records]}

@@ -79,3 +79,4 @@ dist/
 build/
 screenshots_vision/
 .custom_test_domain
+.ace-tool/

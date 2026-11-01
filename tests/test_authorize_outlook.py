@@ -1,4 +1,8 @@
+import os
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -120,6 +124,52 @@ class AuthorizeOutlookTests(unittest.TestCase):
         browser_authorize.assert_called_once_with(
             ("user@outlook.com", "secret"), 3, ""
         )
+
+    @patch("tools.extract_graph_tokens.get_graph_token")
+    def test_persists_each_result_before_slower_future_finishes(self, get_graph_token):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "accounts.txt"
+            input_path.write_text(
+                "slow@outlook.com----secret-slow\n"
+                "fast@outlook.com----secret-fast\n",
+                encoding="utf-8",
+            )
+            observed_fast_persist = threading.Event()
+
+            def issue_token(email, password, index):
+                if email == "slow@outlook.com":
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline:
+                        pool_path = Path(directory) / "emails.txt"
+                        if pool_path.is_file() and "fast@outlook.com----secret-fast----" in pool_path.read_text(
+                            encoding="utf-8"
+                        ):
+                            observed_fast_persist.set()
+                            break
+                        time.sleep(0.02)
+                return {
+                    "refresh_token": f"refresh-{email.split('@', 1)[0]}",
+                    "client_id": "client",
+                }
+
+            get_graph_token.side_effect = issue_token
+            with patch.dict(os.environ, {"REG_FACTORY_DATA_DIR": directory}, clear=False), patch.object(
+                sys,
+                "argv",
+                [
+                    "authorize_outlook.py",
+                    "--input",
+                    str(input_path),
+                    "--concurrency",
+                    "2",
+                ],
+            ):
+                self.assertEqual(authorize_outlook.main(), 0)
+
+            self.assertTrue(observed_fast_persist.is_set())
+            saved = (Path(directory) / "emails.txt").read_text(encoding="utf-8")
+            self.assertIn("fast@outlook.com----secret-fast----refresh-fast----client", saved)
+            self.assertIn("slow@outlook.com----secret-slow----refresh-slow----client", saved)
 
 
 if __name__ == "__main__":

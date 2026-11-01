@@ -15,7 +15,9 @@ import sys
 import time
 import asyncio
 import html
+import json
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 if sys.platform == "win32":
@@ -37,6 +39,142 @@ MICROSOFT_RECOVERY_SUBJECTS = (
     "verify",
     "code",
 )
+
+
+def _graph_recovery_mailbox_store(environ=None) -> Path:
+    env = os.environ if environ is None else environ
+    root = Path(str(env.get("REG_FACTORY_DATA_DIR") or Path(__file__).resolve().parents[1]))
+    return root.expanduser() / "runtime" / "graph_recovery_mailboxes.json"
+
+
+def remember_graph_recovery_mailbox(account_email, mailbox, environ=None) -> None:
+    """Persist only the reusable recovery-address identity for a Graph account."""
+    account = str(account_email or "").strip().lower()
+    provider = str((mailbox or {}).get("provider") or "").strip().lower()
+    address = str((mailbox or {}).get("email") or "").strip().lower()
+    if not account or not provider or not address:
+        return
+    from common.file_lock import file_lock
+
+    path = _graph_recovery_mailbox_store(environ)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(path):
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            saved = {}
+        if not isinstance(saved, dict):
+            saved = {}
+        saved[account] = {"provider": provider, "email": address}
+        temporary = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(saved, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        temporary.replace(path)
+
+
+def _restore_cfmail_recovery_mailbox(address):
+    """Reissue an address-scoped CFMail JWT for a previously saved address."""
+    try:
+        from common.temp_email import CFMAIL_ADMIN_PASSWORD, CFMAIL_BASE_URL
+    except Exception:
+        return None
+    base = str(CFMAIL_BASE_URL or "").rstrip("/")
+    password = str(CFMAIL_ADMIN_PASSWORD or "").strip()
+    if not base or not password:
+        return None
+    headers = {"x-admin-auth": password}
+    try:
+        response = requests.get(
+            f"{base}/admin/address",
+            headers=headers,
+            params={"query": address, "limit": 100, "offset": 0},
+            timeout=15,
+        )
+        if response.status_code != 200:
+            return None
+        rows = (response.json() or {}).get("results") or []
+        row = next(
+            (item for item in rows if str(item.get("name") or "").strip().lower() == address),
+            None,
+        )
+        mailbox_id = row.get("id") if isinstance(row, dict) else None
+        if mailbox_id is None:
+            return None
+        token_response = requests.get(
+            f"{base}/admin/show_password/{mailbox_id}",
+            headers=headers,
+            timeout=15,
+        )
+        if token_response.status_code != 200:
+            return None
+        token = str((token_response.json() or {}).get("jwt") or "").strip()
+        if not token:
+            return None
+        return {
+            "id": str(mailbox_id),
+            "email": address,
+            "token": token,
+            "provider": "cfmail",
+        }
+    except (requests.RequestException, TypeError, ValueError):
+        return None
+
+
+def restore_graph_recovery_mailbox(account_email, environ=None):
+    """Recover a saved mailbox for a resumed browser Graph authorization."""
+    account = str(account_email or "").strip().lower()
+    if not account:
+        return None
+    path = _graph_recovery_mailbox_store(environ)
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        record = saved.get(account) if isinstance(saved, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    provider = str(record.get("provider") or "").strip().lower()
+    address = str(record.get("email") or "").strip().lower()
+    if provider == "cfmail" and address:
+        return _restore_cfmail_recovery_mailbox(address)
+    return None
+
+
+def restore_graph_recovery_mailbox_from_mask(masked_address):
+    """Restore a CFMail inbox only when the visible mask resolves uniquely."""
+    match = re.fullmatch(
+        r"([a-z0-9._+-]+)\*+@([a-z0-9.-]+)",
+        str(masked_address or "").strip().lower(),
+    )
+    if not match:
+        return None
+    prefix, domain = match.groups()
+    try:
+        from common.temp_email import CFMAIL_ADMIN_PASSWORD, CFMAIL_BASE_URL
+    except Exception:
+        return None
+    base = str(CFMAIL_BASE_URL or "").rstrip("/")
+    password = str(CFMAIL_ADMIN_PASSWORD or "").strip()
+    if not base or not password:
+        return None
+    try:
+        response = requests.get(
+            f"{base}/admin/address",
+            headers={"x-admin-auth": password},
+            params={"query": prefix, "limit": 100, "offset": 0},
+            timeout=15,
+        )
+        if response.status_code != 200:
+            return None
+        matches = []
+        for row in (response.json() or {}).get("results") or []:
+            address = str(row.get("name") or "").strip().lower()
+            if address.startswith(prefix) and address.endswith(f"@{domain}"):
+                matches.append(address)
+        if len(matches) != 1:
+            return None
+        return _restore_cfmail_recovery_mailbox(matches[0])
+    except (requests.RequestException, TypeError, ValueError):
+        return None
 
 # Microsoft 端点(login.microsoftonline.com / graph.microsoft.com)不像 ChatGPT 受地域封锁，
 # 不需要走代理；而 Clash 出口节点对 MS 的 TLS 握手常 SSLEOFError(冷连接闪断)。故取码/换 token
@@ -318,7 +456,7 @@ def create_graph_recovery_mailbox(provider, outlook_record=""):
 
 
 def poll_graph_recovery_code(mailbox, max_wait=120, poll_interval=5,
-                             received_after=None):
+                             received_after=None, exclude_codes=()):
     """Read a Microsoft security code from either Graph or a temp mailbox API."""
     provider = str((mailbox or {}).get("provider") or "").strip().lower()
     if provider == OUTLOOK_RECOVERY_PROVIDER:
@@ -331,6 +469,7 @@ def poll_graph_recovery_code(mailbox, max_wait=120, poll_interval=5,
             max_wait=max_wait,
             poll=poll_interval,
             received_after=received_after,
+            exclude_codes=exclude_codes,
         )
 
     from common.temp_email import poll_verification_code_blocking
@@ -339,6 +478,8 @@ def poll_graph_recovery_code(mailbox, max_wait=120, poll_interval=5,
         mailbox["id"], provider, email=mailbox["email"],
         token=mailbox.get("token"), max_wait=max_wait,
         poll_interval=poll_interval,
+        received_after=received_after,
+        exclude_codes=exclude_codes,
     )
 
 

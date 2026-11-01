@@ -668,7 +668,8 @@ def prepare_github_egress(requested="auto"):
 
 
 def load_pool_accounts():
-    """读 _outlook_pool/*.json -> [(email, password, cookies)]，最新优先。"""
+    """读 _outlook_pool/*.json -> [(email, password, cookies)]，最新优先。
+    若池为空，回退到 emails.txt 里的 Outlook/Hotmail 账号（只用 email+password，cookies=None）。"""
     files = sorted(glob.glob(os.path.join(POOL_DIR, "*.json")), reverse=True)
     out = []
     for f in files:
@@ -680,6 +681,24 @@ def load_pool_accounts():
                 out.append((email, pw, d.get("outlook_cookies")))
         except Exception:
             continue
+    if out:
+        return out
+    # fallback: emails.txt  (email----password----rt----client_id)
+    emails_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "emails.txt")
+    if os.path.isfile(emails_path):
+        try:
+            with open(emails_path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split("----")
+                    if len(parts) >= 2:
+                        email, pw = parts[0].strip(), parts[1].strip()
+                        if email and pw and ("@outlook." in email.lower() or "@hotmail." in email.lower() or "@live." in email.lower()):
+                            out.append((email, pw, None))
+        except Exception:
+            pass
     return out
 
 

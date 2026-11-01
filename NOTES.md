@@ -43,3 +43,10 @@
 - 题目：Put the correct piece in the missing spot 属于缺口拼图/拖拽题型。
 - 归类规则：CLAUDE_HCAPTCHA_DRAG_MARKERS 包含 "put the correct piece in the missing spot" 和 "missing spot"。
 - 影响链路：claude_register_from_proton.py（Proton + Claude 批处理）与 register.py（单机/独立注册）。识别后自动走 drag / canvas_drag 拖拽求解器，避免误判为散点图（scatter）。
+
+## 6. Git 交付检查点（2026-11-01）
+
+- 当前工作区分支：`main`；推送目标：`origin/main`。
+- 提交时只纳入已跟踪的源码、配置和测试改动；运行日志、截图、账号/代理数据及临时探针不纳入仓库。
+- 本次提交前验证：修改过的 Python 文件 `py_compile` 通过，`git diff --check` 通过。
+- 定向 unittest 共运行 216 项，其中 206 项通过、5 项失败、5 项错误；失败集中在浏览器/Mock 手工接管路径和既有多语言断言，不能据此宣称全量测试通过。

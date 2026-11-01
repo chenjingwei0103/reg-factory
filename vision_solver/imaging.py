@@ -21,13 +21,16 @@ async def screenshot_frame_region(frame, path):
         return None
 
 
-async def shot_element(scope, selector, path, scale=3):
+async def shot_element(scope, selector, path, scale=3, timeout=None):
     """截 scope(page 或 frame) 里某元素并放大 scale 倍。返回放大后 png base64，失败 None。"""
     try:
         el = scope.locator(selector).first
         if await el.count() == 0:
             return None
-        await el.screenshot(path=path)
+        shot_kwargs = {"path": path}
+        if timeout:
+            shot_kwargs["timeout"] = timeout
+        await el.screenshot(**shot_kwargs)
     except Exception as e:
         print(f"  [img] shot_element({selector}) err: {str(e)[:60]}")
         return None

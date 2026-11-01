@@ -361,6 +361,21 @@ class ICloudMailTests(unittest.TestCase):
         with patch.object(temp_email, "fetch_messages", return_value=[numeric]):
             self.assertEqual(temp_email._scan_once(*args), "654321")
 
+    def test_scan_once_ignores_cfmail_code_before_request_cutoff(self):
+        old_message = {
+            "sender": "account-security-noreply@accountprotection.microsoft.com",
+            "subject": "Your security code",
+            "text": "Use 123456",
+            "created_at": "2026-10-16 06:22:30",
+            "extracted": {"codes": ["123456"]},
+        }
+        args = (
+            "mailbox-id", "cfmail", "recovery@example.test", "address-token", "", "",
+            ("microsoft",), ("code",), None, (),
+        )
+        with patch.object(temp_email, "fetch_messages", return_value=[old_message]):
+            self.assertIsNone(temp_email._scan_once(*args, received_after=1792137600.0))
+
 
 class RemailMailTests(unittest.TestCase):
     def test_create_uses_code_order_contract_and_normalizes_token(self):
