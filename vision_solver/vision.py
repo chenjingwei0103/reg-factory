@@ -203,7 +203,7 @@ def ask_vision(prompt, image_b64, models=None, keys=None, max_tokens=900, temper
                         _endpoint_for_key(key),
                         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                         json=payload,
-                        timeout=120,
+                        timeout=35,
                     )
                     if r.status_code == 200:
                         txt = _log_openai_content(real_model, r)
@@ -211,7 +211,14 @@ def ask_vision(prompt, image_b64, models=None, keys=None, max_tokens=900, temper
                             print(f"  [vision] {real_model} key#{ki} refused, next", flush=True)
                             break
                         return txt
-                    if r.status_code in (404, 429, 500, 502, 503):
+                    if r.status_code == 429:
+                        wait_s = attempt * 1.5
+                        print(f"  [vision] {real_model} key#{ki} 429 rate limited, retry in {wait_s}s (attempt {attempt}/3)...", flush=True)
+                        if attempt < 3:
+                            time.sleep(wait_s)
+                            continue
+                        break
+                    if r.status_code in (404, 500, 502, 503):
                         break
                     print(f"  [vision] {real_model} key#{ki} -> {r.status_code} {r.text[:80]}")
                     break
