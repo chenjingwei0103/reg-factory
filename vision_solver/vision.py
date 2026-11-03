@@ -160,7 +160,7 @@ def _ask_openai_with_chrome_tls(endpoint, key, real_model, payload):
         impersonate="chrome131",
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         json=payload,
-        timeout=35,
+        timeout=50,
     )
     if response.status_code != 200:
         _log_model_http(real_model, response)
@@ -203,7 +203,7 @@ def ask_vision(prompt, image_b64, models=None, keys=None, max_tokens=900, temper
                         _endpoint_for_key(key),
                         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                         json=payload,
-                        timeout=35,
+                        timeout=50,
                     )
                     if r.status_code == 200:
                         txt = _log_openai_content(real_model, r)
@@ -281,7 +281,7 @@ def _ask_one(base, key, model, prompt, image_b64, max_tokens=900):
                     json={"model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": [
                         {"type": "text", "text": prompt},
                         {"type": "image", "source": {"type": "base64", "media_type": mtype, "data": image_b64}}]}]},
-                    timeout=20,
+                    timeout=50,
                 )
                 if r.status_code == 200:
                     try:
@@ -309,7 +309,7 @@ def _ask_one(base, key, model, prompt, image_b64, max_tokens=900):
                         {"type": "text", "text": prompt},
                         {"type": "image_url", "image_url": {"url": f"data:{mtype};base64,{image_b64}"}}]}],
                           "max_tokens": max_tokens, "temperature": 0.0},
-                    timeout=20,
+                    timeout=50,
                 )
                 if r.status_code == 200:
                     txt = _log_openai_content(model, r)
@@ -346,7 +346,7 @@ def _ask_one(base, key, model, prompt, image_b64, max_tokens=900):
                     "max_tokens": max_tokens,
                     "temperature": 0.0,
                 },
-                timeout=35,
+                timeout=50,
             )
             if r.status_code == 200:
                 txt = _log_openai_content(model, r)
